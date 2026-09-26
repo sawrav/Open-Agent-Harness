@@ -18,32 +18,35 @@ MAX_TOKENS: dict[str, int] = {
 }
 
 # ── Thinking / research modes ─────────────────────────────────────────────────
+# budget_tokens: max tokens the model may spend in <thinking> before responding.
+# Must stay well under CTX_SIZE — the prompt + tool results also consume tokens.
+# Rule of thumb: budget_tokens <= CTX_SIZE // 4 to leave room for prompt + output.
 THINKING_MODES: dict[str, int] = {
     "fast":   512,
-    "medium": 4096,
-    "slow":   16384,
+    "medium": 2048,
+    "slow":   4096,   # was 16384, which equalled the entire context window
 }
 DEFAULT_THINKING_MODE = "medium"
 
-# ── Context window management ─────────────────────────────────────────────────
-# Trigger compression when estimated token usage exceeds this fraction of CTX_SIZE.
-CTX_COMPRESS_THRESHOLD = 0.90   # 90%
+# ── Generation limits ─────────────────────────────────────────────────────────
+# Hard ceiling on total tokens generated per response (thinking + content).
+# budget_tokens + max_tokens must leave room for the prompt in the context window.
+# With CTX_SIZE=16384 and ~4-6K typical prompt, max_tokens should be <= 8-10K.
+MAX_TOKENS: dict[str, int] = {
+    "fast":   1024,
+    "medium": 3072,
+    "slow":   6144,
+}
 
-# Characters-per-token estimate used for cheap local token counting.
-# GPT-family average is ~4; llama models are similar.
+# ── Context window management ─────────────────────────────────────────────────
+# Trigger message compression when token usage exceeds this fraction of CTX_SIZE.
+CTX_COMPRESS_THRESHOLD = 0.80   # 80% — compress earlier to stay ahead of overflow
+
+# Characters-per-token estimate for fallback token counting (when /tokenize unavailable).
 CHARS_PER_TOKEN = 4
 
-# How many of the oldest non-system message pairs to summarise per compression pass.
-# Keeps the most recent turns intact for coherence.
-CTX_COMPRESS_KEEP_RECENT = 4    # keep last N user/assistant pairs verbatim
+# Keep the last N user/assistant pairs verbatim during compression.
+CTX_COMPRESS_KEEP_RECENT = 4
 
-# Auto-compaction interval in tokens. Compaction is also triggered when
-# usage exceeds CTX_COMPRESS_THRESHOLD (90%), whichever comes first.
-CTX_COMPACT_INTERVAL = 20_000   # compact every 20K accumulated tokens
-
-# Server-side context expansion — doubles CTX_SIZE when compression alone
-# is not enough. Requires llama-server to be managed by the harness.
-# Set to None to disable server restart entirely.
-LLAMA_SERVER_CMD: list[str] | None = None   # e.g. ["llama-server", "--model", "..."]
-CTX_SIZE_MAX = 131072           # hard cap — never expand beyond this
-CTX_SIZE_MULTIPLIER = 2         # each expansion doubles the window
+# Also trigger auto-compaction every N accumulated tokens regardless of threshold.
+CTX_COMPACT_INTERVAL = 20_000

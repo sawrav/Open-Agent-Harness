@@ -4,7 +4,7 @@ import httpx
 
 from tools.base import BaseTool
 
-MAX_RESPONSE_CHARS = 6000
+MAX_RESPONSE_CHARS = 3000   # ~750 tokens — keeps tool results from flooding context
 TIMEOUT_SECONDS = 15
 
 
@@ -56,7 +56,7 @@ class FetchURLTool(BaseTool):
         "Fetch the text content of a URL and return clean readable text. "
         "HTML is stripped automatically. GitHub repo and blob URLs are "
         "redirected to raw content. "
-        f"Response is capped at {MAX_RESPONSE_CHARS} characters."
+        f"Response is capped at {MAX_RESPONSE_CHARS} characters (~750 tokens)."
     )
     parameters = {
         "type": "object",
