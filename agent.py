@@ -82,33 +82,34 @@ class Agent:
 
         while True:
             printed_anything = False
-            in_reasoning = False  # track whether we are inside a <thinking> block
+            in_reasoning = False
 
-            # ── Stream tokens live ────────────────────────────────────────────
+            # ── Stream tokens live ─────────────────────────────────────────────
+            # Use raw sys.stdout throughout — rich buffers per-line and will
+            # swallow the visual separation between thinking and content blocks.
             async for kind, token in self.llm.stream(self.messages, tools=self.registry.all_schemas()):
                 if kind == "reasoning":
                     if not in_reasoning:
-                        # Print opening tag once on the first reasoning token
-                        sys.stdout.write("\033[2m<thinking>\n")  # ANSI dim
+                        sys.stdout.write("\n\033[2m<thinking>\n")  # dim on
                         in_reasoning = True
                     sys.stdout.write(token)
+                    sys.stdout.flush()
                 else:  # "content"
                     if in_reasoning:
-                        # Close the thinking block before the final response
-                        sys.stdout.write("\n</thinking>\033[0m\n\n")
+                        sys.stdout.write("\n</thinking>\033[0m\n\n")  # dim off
+                        sys.stdout.flush()
                         in_reasoning = False
                     sys.stdout.write(token)
-                sys.stdout.flush()
+                    sys.stdout.flush()
                 printed_anything = True
 
-            # Guard: close thinking block if model ended stream mid-reasoning
+            # Guard: close thinking block if stream ends mid-reasoning
             if in_reasoning:
                 sys.stdout.write("\n</thinking>\033[0m\n\n")
                 sys.stdout.flush()
 
             result = self.llm.last_result
 
-            # Ensure a newline after streamed content
             if printed_anything:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
