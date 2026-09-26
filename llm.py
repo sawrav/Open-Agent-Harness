@@ -67,7 +67,7 @@ class LLMClient:
         Yield (kind, token) tuples as they arrive from the server.
 
         budget_tokens: max tokens spent in <thinking> (None = model default)
-        max_tokens:    hard ceiling on total tokens generated (None = unlimited)
+        max_tokens:    max total tokens generated (None = unlimited)
         """
         payload: dict = {
             "model": config.LLM_MODEL,
