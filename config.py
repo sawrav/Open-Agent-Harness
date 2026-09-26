@@ -27,6 +27,10 @@ CHARS_PER_TOKEN = 4
 # Keeps the most recent turns intact for coherence.
 CTX_COMPRESS_KEEP_RECENT = 4    # keep last N user/assistant pairs verbatim
 
+# Auto-compaction interval in tokens. Compaction is also triggered when
+# usage exceeds CTX_COMPRESS_THRESHOLD (90%), whichever comes first.
+CTX_COMPACT_INTERVAL = 20_000   # compact every 20K accumulated tokens
+
 # Server-side context expansion — doubles CTX_SIZE when compression alone
 # is not enough. Requires llama-server to be managed by the harness.
 # Set to None to disable server restart entirely.

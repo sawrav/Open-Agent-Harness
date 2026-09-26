@@ -28,6 +28,7 @@ COMMANDS = {
     "/tools":       "List all available callable tools",
     "/skills":      "List all loaded Markdown skills",
     "/mode <name>": "Switch thinking mode: fast | medium | slow",
+    "/compact":     "Manually compact memory and erase KV cache",
     "/clear":       "Clear the conversation history (keeps system prompt)",
     "/help":        "Show this help message",
     "/exit":        "Quit the agent",
@@ -156,8 +157,8 @@ class Agent:
 
             # ── No tool calls → done ──────────────────────────────────────────
             if not result.has_tool_calls:
-                # Proactively check and manage context after every completed turn
-                self.messages = await self.ctx_manager.check_and_manage(self.messages)
+                # Update token counters and trigger auto-compaction if needed
+                self.messages = await self.ctx_manager.after_turn(self.messages)
                 break
 
             # ── Execute tool calls concurrently ──────────────────────────────
@@ -287,6 +288,12 @@ class Agent:
                     console.print("[dim]Conversation cleared.[/dim]")
                     continue
 
+                elif user_input.lower() == "/compact":
+                    self.messages = await self.ctx_manager.compact(
+                        self.messages, reason="manual"
+                    )
+                    continue
+
                 elif user_input.lower() == "/help":
                     for cmd, desc in COMMANDS.items():
                         console.print(f"  [bold]{cmd}[/bold]  {desc}")
@@ -306,4 +313,3 @@ class Agent:
 
     async def aclose(self):
         await self.llm.aclose()
-        await self.ctx_manager.stop_server()

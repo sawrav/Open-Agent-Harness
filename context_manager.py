@@ -1,23 +1,24 @@
 """
-context_manager.py — Automatic context window management.
+context_manager.py — Context window management for OpenAgentHarness.
 
-Two-stage strategy:
-  1. Compression (primary)  — when token usage hits CTX_COMPRESS_THRESHOLD,
-     summarise the oldest message pairs in-place using the LLM itself.
-     Fully transparent: no server restart, no conversation break.
+Strategy:
+  - Token counting:   exact counts via llama.cpp /tokenize endpoint
+  - Context tracking: 10K-token increments reported to the user
+  - Auto-compaction:  triggered every 20K tokens of accumulated history
+                      (configurable via CTX_COMPACT_INTERVAL)
+  - Compaction:       summarise old messages via LLM, then erase the slot
+                      KV cache via POST /slots/0?action=erase so llama.cpp
+                      rebuilds the cache from the compacted history
+  - No server restart required at any point.
 
-  2. Server expansion (fallback) — if compression still leaves usage above
-     the threshold (e.g. a single huge tool result), double CTX_SIZE and
-     restart llama-server in the background. Only active when
-     config.LLAMA_SERVER_CMD is set.
+Dynamic context resize is not supported by llama.cpp without restart.
+The correct on-the-fly approach is to keep the message history small
+enough to fit within the fixed context window via compaction.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-import signal
-import subprocess
 from typing import TYPE_CHECKING
 
 import httpx
@@ -31,125 +32,45 @@ if TYPE_CHECKING:
 console = Console()
 
 
-# ── Token estimation ──────────────────────────────────────────────────────────
+# ── Token counting ────────────────────────────────────────────────────────────
 
-def _estimate_tokens(messages: list[dict]) -> int:
+async def count_tokens(text: str, http: httpx.AsyncClient) -> int:
     """
-    Cheap character-based token estimate.
-    Counts all string content in the message list and divides by CHARS_PER_TOKEN.
-    Adds 4 tokens per message for role/structural overhead.
+    Exact token count via llama.cpp /tokenize endpoint.
+    Falls back to char-based estimate if the endpoint is unavailable.
     """
-    total_chars = 0
-    for msg in messages:
-        content = msg.get("content") or ""
-        if isinstance(content, list):
-            # Multi-part content (text + images etc.)
-            for part in content:
-                if isinstance(part, dict):
-                    total_chars += len(part.get("text", ""))
-        else:
-            total_chars += len(content)
-
-        # tool_calls field
-        for tc in msg.get("tool_calls", []):
-            fn = tc.get("function", {})
-            total_chars += len(fn.get("name", "")) + len(fn.get("arguments", ""))
-
-    return (total_chars // config.CHARS_PER_TOKEN) + (len(messages) * 4)
+    try:
+        resp = await http.post(
+            "/tokenize",
+            json={"content": text, "add_special": False},
+            timeout=5.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return len(data.get("tokens", []))
+    except Exception:
+        pass
+    # Fallback: character estimate
+    return len(text) // config.CHARS_PER_TOKEN
 
 
-def usage_ratio(messages: list[dict], ctx_size: int | None = None) -> float:
-    """Return estimated token usage as a fraction of CTX_SIZE."""
-    return _estimate_tokens(messages) / (ctx_size or config.CTX_SIZE)
-
-
-# ── Message compression ───────────────────────────────────────────────────────
-
-async def compress(messages: list[dict], llm: "LLMClient") -> list[dict]:
-    """
-    Summarise the oldest non-system message pairs to free context space.
-
-    Keeps:
-      - The system prompt (index 0)
-      - The most recent CTX_COMPRESS_KEEP_RECENT user/assistant pairs
-      - All tool/tool_call messages in the recent window
-
-    Replaces the older pairs with a single summary assistant message.
-    Returns the new (shorter) message list.
-    """
-    if len(messages) <= 1:
-        return messages
-
-    system_msg = messages[0]
-
-    # Separate non-system messages
-    rest = messages[1:]
-
-    # Identify the boundary: keep the last N user messages and everything after them
-    user_indices = [i for i, m in enumerate(rest) if m.get("role") == "user"]
-
-    if len(user_indices) <= config.CTX_COMPRESS_KEEP_RECENT:
-        # Not enough history to compress
-        return messages
-
-    # Split: old (to summarise) vs recent (to keep verbatim)
-    split_at = user_indices[-config.CTX_COMPRESS_KEEP_RECENT]
-    old_messages = rest[:split_at]
-    recent_messages = rest[split_at:]
-
-    if not old_messages:
-        return messages
-
-    console.print(
-        f"  [dim yellow]⟳  Context at {usage_ratio(messages):.0%} — "
-        f"compressing {len(old_messages)} old messages…[/dim yellow]"
+async def count_messages_tokens(messages: list[dict], http: httpx.AsyncClient) -> int:
+    """Count total tokens across all messages. Adds 4 overhead tokens per message."""
+    text = " ".join(
+        (msg.get("content") or "") +
+        " ".join(
+            tc.get("function", {}).get("name", "") +
+            tc.get("function", {}).get("arguments", "")
+            for tc in msg.get("tool_calls", [])
+        )
+        for msg in messages
     )
-
-    # Build a summarisation prompt — do NOT pass tools so model returns plain text
-    summary_request = [
-        {
-            "role": "system",
-            "content": (
-                "You are a concise summariser. "
-                "Summarise the following conversation history into a compact paragraph "
-                "that preserves all key facts, decisions, tool results, and context "
-                "needed to continue the conversation. Be thorough but brief."
-            ),
-        },
-        {
-            "role": "user",
-            "content": "Summarise this conversation history:\n\n"
-            + _messages_to_text(old_messages),
-        },
-    ]
-
-    # Use a lightweight stream call — no tools, no budget
-    summary_parts: list[str] = []
-    async for kind, token in llm.stream(summary_request):
-        if kind == "content":
-            summary_parts.append(token)
-
-    summary = "".join(summary_parts).strip()
-    if not summary:
-        # Summarisation failed — fall back to truncating old messages
-        console.print("  [dim red]⚠  Summarisation returned empty — truncating oldest messages[/dim red]")
-        return [system_msg] + recent_messages
-
-    summary_msg = {
-        "role": "assistant",
-        "content": f"[Conversation summary — {len(old_messages)} messages compressed]\n\n{summary}",
-    }
-
-    new_messages = [system_msg, summary_msg] + recent_messages
-    new_ratio = usage_ratio(new_messages)
-    console.print(
-        f"  [dim green]✓  Compressed to {new_ratio:.0%} of context window[/dim green]"
-    )
-    return new_messages
+    token_count = await count_tokens(text, http)
+    return token_count + (len(messages) * 4)
 
 
 def _messages_to_text(messages: list[dict]) -> str:
-    """Render messages as plain text for the summarisation prompt."""
+    """Render messages as plain readable text for summarisation."""
     lines = []
     for msg in messages:
         role = msg.get("role", "unknown").upper()
@@ -164,154 +85,203 @@ def _messages_to_text(messages: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-# ── Server-side context expansion ─────────────────────────────────────────────
+# ── KV cache erase ────────────────────────────────────────────────────────────
 
-class ServerManager:
+async def erase_kv_cache(http: httpx.AsyncClient, slot_id: int = 0) -> bool:
     """
-    Manages the llama-server process lifetime for context expansion.
-
-    Only active when config.LLAMA_SERVER_CMD is set.
-    Doubles --ctx-size on each expansion, up to CTX_SIZE_MAX.
+    Erase llama.cpp's KV cache for the given slot via POST /slots/{id}?action=erase.
+    Returns True on success. After this, the next request will rebuild the KV
+    cache from scratch using the (compacted) message history.
     """
-
-    def __init__(self):
-        self._proc: subprocess.Popen | None = None
-        self._current_ctx: int = config.CTX_SIZE
-
-    def is_managed(self) -> bool:
-        return bool(config.LLAMA_SERVER_CMD)
-
-    async def expand(self) -> int | None:
-        """
-        Double the context size and restart the server.
-        Returns the new ctx size, or None if expansion is not possible.
-        """
-        if not self.is_managed():
-            return None
-
-        new_ctx = self._current_ctx * config.CTX_SIZE_MULTIPLIER
-        if new_ctx > config.CTX_SIZE_MAX:
-            console.print(
-                f"  [red]⚠  Cannot expand context further "
-                f"(already at max {config.CTX_SIZE_MAX} tokens)[/red]"
-            )
-            return None
-
-        console.print(
-            f"  [yellow]⟳  Expanding context: {self._current_ctx} → {new_ctx} tokens. "
-            f"Restarting server…[/yellow]"
+    try:
+        resp = await http.post(
+            f"/slots/{slot_id}?action=erase",
+            timeout=10.0,
         )
-
-        await self._stop()
-        await self._start(new_ctx)
-        await self._wait_until_ready()
-
-        self._current_ctx = new_ctx
-        console.print(f"  [green]✓  Server restarted with ctx={new_ctx}[/green]")
-        return new_ctx
-
-    async def _stop(self):
-        if self._proc and self._proc.poll() is None:
-            self._proc.send_signal(signal.SIGTERM)
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._proc.wait)
-        self._proc = None
-
-    async def _start(self, ctx_size: int):
-        cmd = _inject_ctx_size(list(config.LLAMA_SERVER_CMD), ctx_size)
-        self._proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    async def _wait_until_ready(self, timeout: float = 60.0):
-        """Poll /health until the server responds or timeout."""
-        base = config.LLM_BASE_URL.rstrip("/").removesuffix("/v1")
-        deadline = asyncio.get_event_loop().time() + timeout
-        async with httpx.AsyncClient() as client:
-            while asyncio.get_event_loop().time() < deadline:
-                try:
-                    r = await client.get(f"{base}/health", timeout=2.0)
-                    if r.status_code == 200:
-                        return
-                except Exception:
-                    pass
-                await asyncio.sleep(1.0)
-        raise TimeoutError(f"llama-server did not become ready within {timeout}s")
-
-    async def stop(self):
-        await self._stop()
+        return resp.status_code == 200
+    except Exception:
+        return False
 
 
-def _inject_ctx_size(cmd: list[str], ctx_size: int) -> list[str]:
-    """Replace --ctx-size value in the command list, or append it if absent."""
-    for i, arg in enumerate(cmd):
-        if arg in ("--ctx-size", "-c") and i + 1 < len(cmd):
-            cmd[i + 1] = str(ctx_size)
-            return cmd
-    return cmd + ["--ctx-size", str(ctx_size)]
+# ── Message compression ───────────────────────────────────────────────────────
+
+async def compress_messages(
+    messages: list[dict],
+    llm: "LLMClient",
+) -> list[dict]:
+    """
+    Summarise the oldest non-system message pairs to reduce token usage.
+
+    Keeps:
+      - messages[0]: system prompt (always)
+      - Last CTX_COMPRESS_KEEP_RECENT user/assistant pairs verbatim
+
+    Replaces the older pairs with a single compact summary assistant message.
+    Returns the new shorter message list.
+    """
+    if len(messages) <= 1:
+        return messages
+
+    system_msg = messages[0]
+    rest = messages[1:]
+
+    user_indices = [i for i, m in enumerate(rest) if m.get("role") == "user"]
+
+    if len(user_indices) <= config.CTX_COMPRESS_KEEP_RECENT:
+        return messages  # not enough history to compress
+
+    split_at = user_indices[-config.CTX_COMPRESS_KEEP_RECENT]
+    old_messages = rest[:split_at]
+    recent_messages = rest[split_at:]
+
+    if not old_messages:
+        return messages
+
+    # Build summarisation request — no tools, no thinking budget
+    summary_request = [
+        {
+            "role": "system",
+            "content": (
+                "You are a concise summariser. "
+                "Summarise the following conversation into a compact paragraph "
+                "preserving all key facts, decisions, tool results, file paths, "
+                "code snippets, and context needed to continue the conversation. "
+                "Be thorough but brief. Output only the summary, no preamble."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Summarise:\n\n" + _messages_to_text(old_messages),
+        },
+    ]
+
+    summary_parts: list[str] = []
+    async for kind, token in llm.stream(summary_request):
+        if kind == "content":
+            summary_parts.append(token)
+
+    summary = "".join(summary_parts).strip()
+    if not summary:
+        # Summarisation failed — hard-truncate instead
+        return [system_msg] + recent_messages
+
+    summary_msg = {
+        "role": "assistant",
+        "content": (
+            f"[Summary of {len(old_messages)} earlier messages]\n\n{summary}"
+        ),
+    }
+
+    return [system_msg, summary_msg] + recent_messages
 
 
-# ── ContextManager — orchestrates both strategies ─────────────────────────────
+# ── ContextManager ────────────────────────────────────────────────────────────
 
 class ContextManager:
     """
-    Orchestrates context compression and server-side expansion.
+    Orchestrates token tracking, auto-compaction, and KV cache management.
 
-    Call check_and_manage() after every completed turn to proactively
-    keep context usage below the threshold. Also call handle_overflow()
-    when a 400/exceed_context_size error is received mid-turn.
+    Token tracking:
+      - Uses exact /tokenize counts
+      - Reports progress in 10K-token increments
+      - Triggers auto-compaction every CTX_COMPACT_INTERVAL tokens
+
+    Compaction (manual /compact or auto):
+      1. Summarise old messages via LLM (compress_messages)
+      2. Erase slot KV cache (erase_kv_cache)
+      3. Next LLM request rebuilds KV from compacted history
+
+    No server restart. No dynamic resize. Works within the fixed ctx window.
     """
 
     def __init__(self, llm: "LLMClient"):
         self._llm = llm
-        self._server = ServerManager()
-        self._ctx_size = config.CTX_SIZE
+        self._http = llm._http          # reuse the same httpx client
+        self._last_reported_band = 0    # last 10K band reported to user
+        self._tokens_since_compact = 0  # accumulates toward compact interval
+        self._total_tokens = 0          # lifetime token counter
 
-    async def check_and_manage(self, messages: list[dict]) -> list[dict]:
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    async def after_turn(self, messages: list[dict]) -> list[dict]:
         """
-        Check usage after a turn completes. If above threshold, compress.
-        If still above after compression, expand server context.
-        Returns the (possibly modified) message list.
+        Called after every completed turn.
+        - Updates token counters
+        - Reports 10K-band progress
+        - Triggers auto-compaction at CTX_COMPACT_INTERVAL
+        Returns (possibly compacted) message list.
         """
-        ratio = usage_ratio(messages, self._ctx_size)
-        if ratio < config.CTX_COMPRESS_THRESHOLD:
-            return messages  # nothing to do
+        token_count = await count_messages_tokens(messages, self._http)
+        self._total_tokens = token_count
+        self._tokens_since_compact += token_count  # approximate delta
 
-        # Stage 1: compress
-        messages = await compress(messages, self._llm)
-        ratio = usage_ratio(messages, self._ctx_size)
+        # Report 10K band transitions
+        band = (token_count // 10_000) * 10_000
+        if band > self._last_reported_band:
+            self._last_reported_band = band
+            ratio = token_count / config.CTX_SIZE
+            console.print(
+                f"  [dim]📊 Context: ~{token_count:,} tokens "
+                f"({ratio:.0%} of {config.CTX_SIZE:,})[/dim]"
+            )
 
-        # Stage 2: server expansion if still over threshold and server is managed
-        if ratio >= config.CTX_COMPRESS_THRESHOLD:
-            new_ctx = await self._server.expand()
-            if new_ctx:
-                self._ctx_size = new_ctx
+        # Auto-compaction threshold
+        if token_count >= config.CTX_SIZE * config.CTX_COMPRESS_THRESHOLD:
+            messages = await self.compact(messages, reason="auto (90% threshold)")
+
+        elif self._tokens_since_compact >= config.CTX_COMPACT_INTERVAL:
+            messages = await self.compact(messages, reason="auto (20K interval)")
 
         return messages
 
     async def handle_overflow(self, messages: list[dict]) -> list[dict]:
         """
-        Called immediately when a context overflow error is received.
-        More aggressive: compresses first, then expands if needed.
-        Returns the updated message list ready to retry.
+        Called immediately on exceed_context_size_error.
+        Forces compaction and KV erase before the turn is retried.
         """
         console.print(
-            "  [bold red]Context overflow detected — compressing and retrying…[/bold red]"
+            "  [bold red]Context overflow — compacting and erasing KV cache…[/bold red]"
         )
-        messages = await compress(messages, self._llm)
-        ratio = usage_ratio(messages, self._ctx_size)
+        return await self.compact(messages, reason="overflow recovery", force_kv_erase=True)
 
-        if ratio >= config.CTX_COMPRESS_THRESHOLD:
-            new_ctx = await self._server.expand()
-            if new_ctx:
-                self._ctx_size = new_ctx
+    async def compact(
+        self,
+        messages: list[dict],
+        reason: str = "manual",
+        force_kv_erase: bool = False,
+    ) -> list[dict]:
+        """
+        Full compaction cycle:
+          1. LLM-summarise old messages
+          2. Erase KV cache so llama.cpp rebuilds from compacted history
+        """
+        before = await count_messages_tokens(messages, self._http)
+        console.print(
+            f"  [yellow]⟳  Compacting memory ({reason}) — "
+            f"~{before:,} tokens in history…[/yellow]"
+        )
+
+        messages = await compress_messages(messages, self._llm)
+
+        after = await count_messages_tokens(messages, self._http)
+        saved = before - after
+        ratio = after / config.CTX_SIZE
+
+        # Always erase KV cache after compaction — the cache is now stale
+        erased = await erase_kv_cache(self._http)
+        kv_note = " KV cache erased." if erased else " (KV erase failed — continuing anyway)"
+
+        console.print(
+            f"  [green]✓  Compacted: {before:,} → {after:,} tokens "
+            f"(saved {saved:,}).{kv_note} "
+            f"Context now at {ratio:.0%}[/green]"
+        )
+
+        # Reset interval counter
+        self._tokens_since_compact = 0
+        self._last_reported_band = (after // 10_000) * 10_000
 
         return messages
 
-    def current_ctx_size(self) -> int:
-        return self._ctx_size
-
-    async def stop_server(self):
-        await self._server.stop()
+    async def token_count(self, messages: list[dict]) -> int:
+        return await count_messages_tokens(messages, self._http)
