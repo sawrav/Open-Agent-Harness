@@ -84,7 +84,12 @@ class Agent:
           1. Stream the LLM response token-by-token to stdout.
           2. If the model called tools, run them all concurrently.
           3. Feed results back and repeat until the model returns plain text.
+
+        Caps at MAX_TOOL_ROUNDS tool-call rounds per turn to break circular loops.
         """
+        MAX_TOOL_ROUNDS = 10
+        tool_rounds = 0
+
         self.messages.append({"role": "user", "content": user_input})
 
         while True:
@@ -162,6 +167,30 @@ class Agent:
                 break
 
             # ── Execute tool calls concurrently ──────────────────────────────
+            tool_rounds += 1
+            if tool_rounds >= MAX_TOOL_ROUNDS:
+                console.print(
+                    f"  [yellow]⚠  Reached {MAX_TOOL_ROUNDS} tool-call rounds — "
+                    f"nudging model to respond.[/yellow]"
+                )
+                # Inject a system nudge as a user message to break the loop
+                self.messages.append({
+                    "role": "user",
+                    "content": (
+                        "You have now gathered enough information. "
+                        "Stop calling tools and provide your final response directly."
+                    ),
+                })
+                # One final LLM call with no tools offered
+                async for kind, token in self.llm.stream(self.messages, tools=None):
+                    if kind in ("content", "reasoning"):
+                        sys.stdout.write(token)
+                        sys.stdout.flush()
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self.messages = await self.ctx_manager.after_turn(self.messages)
+                return
+
             tool_results = await self._execute_tool_calls(result.tool_calls)
             self.messages.extend(tool_results)
 
