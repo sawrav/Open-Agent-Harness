@@ -20,6 +20,7 @@ from rich.markdown import Markdown
 import config
 from llm import LLMClient, ToolCallAccumulator
 from registry import ToolRegistry
+from context_manager import ContextManager
 
 console = Console()
 
@@ -42,6 +43,7 @@ class Agent:
     def __init__(self):
         self.llm = LLMClient()
         self.registry = ToolRegistry()
+        self.ctx_manager = ContextManager(self.llm)
         self.messages: list[dict] = []
         self._mode: str = config.DEFAULT_THINKING_MODE
         self._reset_messages()
@@ -100,11 +102,25 @@ class Agent:
                     # Server-side error — print it and abort this turn cleanly
                     sys.stdout.write("\n")
                     sys.stdout.flush()
-                    console.print(f"[red]Error:[/red] {token}")
-                    # Remove the user message we just appended so history stays clean
-                    if self.messages and self.messages[-1]["role"] == "user":
-                        self.messages.pop()
-                    return
+
+                    # Detect context overflow (400 exceed_context_size_error)
+                    if "exceed_context_size" in token or "exceeds the available context" in token:
+                        console.print(f"[red]Error:[/red] {token}")
+                        # Pop the user message before compressing so it can be retried
+                        if self.messages and self.messages[-1]["role"] == "user":
+                            user_msg = self.messages.pop()
+                        else:
+                            user_msg = None
+                        self.messages = await self.ctx_manager.handle_overflow(self.messages)
+                        # Re-append user message and retry the turn
+                        if user_msg:
+                            self.messages.append(user_msg)
+                        continue  # retry the while True loop
+                    else:
+                        console.print(f"[red]Error:[/red] {token}")
+                        if self.messages and self.messages[-1]["role"] == "user":
+                            self.messages.pop()
+                        return
                 elif kind == "reasoning":
                     if not in_reasoning:
                         sys.stdout.write("\n\033[2m<thinking>\n")  # dim on
@@ -140,6 +156,8 @@ class Agent:
 
             # ── No tool calls → done ──────────────────────────────────────────
             if not result.has_tool_calls:
+                # Proactively check and manage context after every completed turn
+                self.messages = await self.ctx_manager.check_and_manage(self.messages)
                 break
 
             # ── Execute tool calls concurrently ──────────────────────────────
@@ -288,3 +306,4 @@ class Agent:
 
     async def aclose(self):
         await self.llm.aclose()
+        await self.ctx_manager.stop_server()

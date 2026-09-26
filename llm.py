@@ -101,17 +101,14 @@ class LLMClient:
         tool_accumulators: dict[int, ToolCallAccumulator] = {}
 
         async with self._http.stream("POST", "/chat/completions", json=payload) as resp:
-            # Handle HTTP errors gracefully — yield an error content token
-            # rather than raising, so the agent loop stays alive.
+            # Handle HTTP errors gracefully — yield an error tuple rather than
+            # raising, so the agent loop stays alive and can handle each case.
             if resp.status_code >= 400:
                 body = await resp.aread()
-                error_text = body.decode(errors="replace")[:300]
-                # 500 from llama.cpp often means context overflow or bad message shape
-                if resp.status_code == 500:
-                    tip = " (context may be full — try /clear to reset conversation)"
-                else:
-                    tip = ""
-                yield ("error", f"Server error {resp.status_code}{tip}: {error_text}")
+                error_text = body.decode(errors="replace")[:500]
+                # Pass the raw body through so the agent can detect specific
+                # error types (e.g. exceed_context_size_error from llama.cpp)
+                yield ("error", f"Server error {resp.status_code}: {error_text}")
                 self._last_result = StreamResult(content="", tool_calls=[])
                 return
 
