@@ -82,16 +82,33 @@ class Agent:
 
         while True:
             printed_anything = False
+            in_reasoning = False  # track whether we are inside a <thinking> block
 
             # ── Stream tokens live ────────────────────────────────────────────
-            async for token in self.llm.stream(self.messages, tools=self.registry.all_schemas()):
-                sys.stdout.write(token)
+            async for kind, token in self.llm.stream(self.messages, tools=self.registry.all_schemas()):
+                if kind == "reasoning":
+                    if not in_reasoning:
+                        # Print opening tag once on the first reasoning token
+                        sys.stdout.write("\033[2m<thinking>\n")  # ANSI dim
+                        in_reasoning = True
+                    sys.stdout.write(token)
+                else:  # "content"
+                    if in_reasoning:
+                        # Close the thinking block before the final response
+                        sys.stdout.write("\n</thinking>\033[0m\n\n")
+                        in_reasoning = False
+                    sys.stdout.write(token)
                 sys.stdout.flush()
                 printed_anything = True
 
+            # Guard: close thinking block if model ended stream mid-reasoning
+            if in_reasoning:
+                sys.stdout.write("\n</thinking>\033[0m\n\n")
+                sys.stdout.flush()
+
             result = self.llm.last_result
 
-            # Ensure a newline after streamed text
+            # Ensure a newline after streamed content
             if printed_anything:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
