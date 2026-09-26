@@ -85,12 +85,19 @@ class Agent:
           2. If the model called tools, run them all concurrently.
           3. Feed results back and repeat until the model returns plain text.
 
+        On context overflow: compacts only historical messages (before this turn),
+        preserving all tool calls and results already accumulated in the current
+        turn, then resumes generation without re-executing any tools.
+
         Caps at MAX_TOOL_ROUNDS tool-call rounds per turn to break circular loops.
         """
         MAX_TOOL_ROUNDS = 10
         tool_rounds = 0
 
         self.messages.append({"role": "user", "content": user_input})
+        # Record the index of the first message in this turn so we can
+        # preserve in-progress work during overflow compaction.
+        turn_start_index = len(self.messages) - 1
 
         while True:
             printed_anything = False
@@ -105,23 +112,31 @@ class Agent:
                 budget_tokens=config.THINKING_MODES[self._mode],
             ):
                 if kind == "error":
-                    # Server-side error — print it and abort this turn cleanly
                     sys.stdout.write("\n")
                     sys.stdout.flush()
 
-                    # Detect context overflow (400 exceed_context_size_error)
                     if "exceed_context_size" in token or "exceeds the available context" in token:
                         console.print(f"[red]Error:[/red] {token}")
-                        # Pop the user message before compressing so it can be retried
-                        if self.messages and self.messages[-1]["role"] == "user":
-                            user_msg = self.messages.pop()
-                        else:
-                            user_msg = None
-                        self.messages = await self.ctx_manager.handle_overflow(self.messages)
-                        # Re-append user message and retry the turn
-                        if user_msg:
-                            self.messages.append(user_msg)
-                        continue  # retry the while True loop
+
+                        # Split messages into:
+                        #   history  = everything before this turn (safe to compact)
+                        #   cur_turn = this turn's messages (tool calls + results so far)
+                        history  = self.messages[:turn_start_index]
+                        cur_turn = self.messages[turn_start_index:]
+
+                        # Compact only the history — preserve current turn work
+                        history = await self.ctx_manager.handle_overflow(history)
+
+                        # Rebuild message list: compacted history + current turn
+                        self.messages = history + cur_turn
+                        # Update turn_start_index to reflect new history length
+                        turn_start_index = len(history)
+
+                        console.print(
+                            "  [dim]Resuming turn with compacted history "
+                            f"({len(cur_turn)} current-turn messages preserved)…[/dim]"
+                        )
+                        continue  # retry only the current LLM call, not the whole turn
                     else:
                         console.print(f"[red]Error:[/red] {token}")
                         if self.messages and self.messages[-1]["role"] == "user":
