@@ -1,5 +1,8 @@
-import subprocess
+import asyncio
+
 from tools.base import BaseTool
+
+TIMEOUT_SECONDS = 30
 
 
 class ShellTool(BaseTool):
@@ -19,18 +22,24 @@ class ShellTool(BaseTool):
         "required": ["command"],
     }
 
-    def run(self, command: str) -> str:
+    async def run(self, command: str) -> str:
         try:
-            result = subprocess.run(
+            proc = await asyncio.create_subprocess_shell(
                 command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            output = (result.stdout + result.stderr).strip()
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                return f"Error: command timed out after {TIMEOUT_SECONDS}s"
+
+            output = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
             return output if output else "(no output)"
-        except subprocess.TimeoutExpired:
-            return "Error: command timed out after 30 seconds"
+
         except Exception as e:
             return f"Error: {e}"

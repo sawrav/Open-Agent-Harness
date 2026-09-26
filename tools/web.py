@@ -1,9 +1,9 @@
-import urllib.request
-import urllib.error
+import httpx
+
 from tools.base import BaseTool
 
-# Maximum characters returned from a fetched page to avoid flooding the context.
 MAX_RESPONSE_CHARS = 8000
+TIMEOUT_SECONDS = 15
 
 
 class FetchURLTool(BaseTool):
@@ -23,18 +23,19 @@ class FetchURLTool(BaseTool):
         "required": ["url"],
     }
 
-    def run(self, url: str) -> str:
+    async def run(self, url: str) -> str:
         try:
-            req = urllib.request.Request(
-                url,
+            async with httpx.AsyncClient(
                 headers={"User-Agent": "OpenAgentHarness/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                content = resp.read().decode(errors="replace")
-                return content[:MAX_RESPONSE_CHARS]
-        except urllib.error.HTTPError as e:
-            return f"HTTP Error {e.code}: {e.reason}"
-        except urllib.error.URLError as e:
-            return f"URL Error: {e.reason}"
+                timeout=TIMEOUT_SECONDS,
+                follow_redirects=True,
+            ) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                return resp.text[:MAX_RESPONSE_CHARS]
+        except httpx.HTTPStatusError as e:
+            return f"HTTP Error {e.response.status_code}: {e.response.reason_phrase}"
+        except httpx.RequestError as e:
+            return f"Request Error: {e}"
         except Exception as e:
             return f"Error: {e}"

@@ -114,13 +114,13 @@ class ToolRegistry:
         """Return OpenAI function-calling schemas for every registered tool."""
         return [t.to_openai_schema() for t in self._tools.values()]
 
-    def run(self, name: str, **kwargs) -> str:
-        """Execute a tool by name and return its string result."""
+    async def run(self, name: str, **kwargs) -> str:
+        """Execute a tool by name asynchronously and return its string result."""
         tool = self.get(name)
         if not tool:
             return f"Error: unknown tool '{name}'"
         try:
-            return tool.run(**kwargs)
+            return await tool.run(**kwargs)
         except Exception as e:
             return f"Error running '{name}': {e}"
 
