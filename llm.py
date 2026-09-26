@@ -61,12 +61,14 @@ class LLMClient:
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[tuple[str, str]]:
         """
-        Yield text tokens as they arrive from the server.
+        Yield (kind, token) tuples as they arrive from the server:
+          - kind == "reasoning"  → token from <thinking> block (delta.reasoning_content)
+          - kind == "content"    → token from the final response (delta.content)
 
-        After the iterator is exhausted, call .last_result to get the full
-        StreamResult including any accumulated tool calls.
+        After the iterator is exhausted, .last_result holds the full StreamResult
+        including any accumulated tool calls.
         """
         payload: dict = {
             "model": config.LLM_MODEL,
@@ -81,7 +83,7 @@ class LLMClient:
         # Map from index → accumulator for multi-tool-call responses
         tool_accumulators: dict[int, ToolCallAccumulator] = {}
 
-        async with self._http.stream("POST", "/v1/chat/completions", json=payload) as resp:
+        async with self._http.stream("POST", "/chat/completions", json=payload) as resp:
             resp.raise_for_status()
 
             async for raw_line in resp.aiter_lines():
@@ -104,11 +106,18 @@ class LLMClient:
 
                 delta = choices[0].get("delta", {})
 
+                # ── Reasoning token (<thinking>) ──────────────────────────────
+                # llama.cpp emits thinking tokens in delta.reasoning_content,
+                # separate from the final response in delta.content.
+                reasoning_token = delta.get("reasoning_content")
+                if reasoning_token:
+                    yield ("reasoning", reasoning_token)
+
                 # ── Text token ────────────────────────────────────────────────
                 token = delta.get("content")
                 if token:
                     content_parts.append(token)
-                    yield token
+                    yield ("content", token)
 
                 # ── Tool call delta ───────────────────────────────────────────
                 for tc_delta in delta.get("tool_calls", []):
