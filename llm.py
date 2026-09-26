@@ -61,11 +61,17 @@ class LLMClient:
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        budget_tokens: int | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         """
         Yield (kind, token) tuples as they arrive from the server:
           - kind == "reasoning"  → token from <thinking> block (delta.reasoning_content)
           - kind == "content"    → token from the final response (delta.content)
+
+        budget_tokens controls how many tokens the model may spend thinking:
+          - None  → no thinking field sent (model default)
+          - 0     → thinking disabled
+          - N > 0 → model may think for up to N tokens
 
         After the iterator is exhausted, .last_result holds the full StreamResult
         including any accumulated tool calls.
@@ -78,6 +84,17 @@ class LLMClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+
+        # llama.cpp thinking budget — passed as top-level thinking object
+        # mirroring the Anthropic extended-thinking API shape that llama.cpp adopts.
+        if budget_tokens is not None:
+            if budget_tokens > 0:
+                payload["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": budget_tokens,
+                }
+            else:
+                payload["thinking"] = {"type": "disabled"}
 
         content_parts: list[str] = []
         # Map from index → accumulator for multi-tool-call responses
