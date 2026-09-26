@@ -61,22 +61,21 @@ class LLMClient:
         messages: list[dict],
         tools: list[dict] | None = None,
         budget_tokens: int | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         """
         Yield (kind, token) tuples as they arrive from the server.
 
-        budget_tokens controls how many tokens the model may spend thinking:
-          - None  → no thinking field sent (model default)
-          - 0     → thinking disabled
-          - N > 0 → model may think for up to N tokens
-
-        After the iterator is exhausted, .last_result holds the full StreamResult.
+        budget_tokens: max tokens spent in <thinking> (None = model default)
+        max_tokens:    max total tokens generated (None = unlimited)
         """
         payload: dict = {
             "model": config.LLM_MODEL,
             "messages": messages,
             "stream": True,
         }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"

@@ -7,6 +7,16 @@ SYSTEM_PROMPT = (
     "Use them when needed to answer the user's request accurately."
 )
 
+# ── Generation limits ─────────────────────────────────────────────────────────
+# Max tokens the model may generate per response (thinking + content combined).
+# -1 = unlimited (default llama.cpp behaviour, can cause very long thinking blocks).
+# Set a sensible cap to prevent runaway generation.
+MAX_TOKENS: dict[str, int] = {
+    "fast":   1024,
+    "medium": 4096,
+    "slow":   8192,
+}
+
 # ── Thinking / research modes ─────────────────────────────────────────────────
 THINKING_MODES: dict[str, int] = {
     "fast":   512,

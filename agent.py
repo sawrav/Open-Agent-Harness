@@ -103,6 +103,7 @@ class Agent:
                 self.messages,
                 tools=self.registry.all_schemas(),
                 budget_tokens=config.THINKING_MODES[self._mode],
+                max_tokens=config.MAX_TOKENS[self._mode],
             ):
                 if kind == "error":
                     # Server-side error — print it and abort this turn cleanly
@@ -182,7 +183,11 @@ class Agent:
                     ),
                 })
                 # One final LLM call with no tools offered
-                async for kind, token in self.llm.stream(self.messages, tools=None):
+                async for kind, token in self.llm.stream(
+                    self.messages,
+                    tools=None,
+                    max_tokens=config.MAX_TOKENS[self._mode],
+                ):
                     if kind in ("content", "reasoning"):
                         sys.stdout.write(token)
                         sys.stdout.flush()
