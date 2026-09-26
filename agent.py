@@ -1,11 +1,24 @@
+"""
+agent.py — Async agentic loop with live token streaming.
+
+Tokens are printed to the terminal the instant llama.cpp emits them.
+Tool calls are accumulated from streaming deltas, executed concurrently
+(when multiple tools are called in one turn), then results are fed back
+for the next LLM turn — all within a single asyncio event loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
 import os
+import sys
 
 from rich.console import Console
 from rich.markdown import Markdown
 
 import config
-from llm import LLMClient
+from llm import LLMClient, ToolCallAccumulator
 from registry import ToolRegistry
 
 console = Console()
@@ -21,12 +34,8 @@ COMMANDS = {
 
 class Agent:
     """
-    Core agentic loop.
-
-    - Sends user messages to the LLM.
-    - Detects tool calls in the response and routes them through the ToolRegistry.
-    - Loops until the model returns a plain text response (no more tool calls).
-    - Skills from SKILL.md files are injected into the system prompt at startup.
+    Async agent that streams LLM tokens directly to stdout and executes
+    tool calls asynchronously between streaming turns.
     """
 
     def __init__(self):
@@ -60,50 +69,102 @@ class Agent:
             {"role": "system", "content": self._build_system_prompt()}
         ]
 
-    # ── Core loop ─────────────────────────────────────────────────────────────
+    # ── Core async loop ───────────────────────────────────────────────────────
 
-    def run_once(self, user_input: str) -> str:
+    async def run_once(self, user_input: str) -> None:
         """
-        Process a single user turn. May invoke tools multiple times before
-        returning the model's final plain-text response.
+        Process one user turn end-to-end:
+          1. Stream the LLM response token-by-token to stdout.
+          2. If the model called tools, run them all concurrently.
+          3. Feed results back and repeat until the model returns plain text.
         """
         self.messages.append({"role": "user", "content": user_input})
 
         while True:
-            msg = self.llm.chat(self.messages, tools=self.registry.all_schemas())
-            self.messages.append(msg)
+            printed_anything = False
 
-            # Model is done — return its text response
-            if not msg.tool_calls:
-                return msg.content or ""
+            # ── Stream tokens live ────────────────────────────────────────────
+            async for token in self.llm.stream(self.messages, tools=self.registry.all_schemas()):
+                sys.stdout.write(token)
+                sys.stdout.flush()
+                printed_anything = True
 
-            # Execute every tool call in this turn
-            for tc in msg.tool_calls:
-                fn_name = tc.function.name
-                fn_args = json.loads(tc.function.arguments)
+            result = self.llm.last_result
 
-                console.print(f"  [dim]⚙  {fn_name}({fn_args})[/dim]")
+            # Ensure a newline after streamed text
+            if printed_anything:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
 
-                result = self.registry.run(fn_name, **fn_args)
+            if result is None:
+                break
 
-                self.messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
+            # Record the assistant turn in message history
+            assistant_msg = self._build_assistant_message(result)
+            self.messages.append(assistant_msg)
+
+            # ── No tool calls → done ──────────────────────────────────────────
+            if not result.has_tool_calls:
+                break
+
+            # ── Execute tool calls concurrently ──────────────────────────────
+            tool_results = await self._execute_tool_calls(result.tool_calls)
+            self.messages.extend(tool_results)
+
+    async def _execute_tool_calls(
+        self, tool_calls: list[ToolCallAccumulator]
+    ) -> list[dict]:
+        """Run all tool calls concurrently and return tool result messages."""
+
+        async def run_one(tc: ToolCallAccumulator) -> dict:
+            try:
+                fn_args = json.loads(tc.arguments) if tc.arguments else {}
+            except json.JSONDecodeError:
+                fn_args = {}
+
+            console.print(f"  [dim]⚙  {tc.name}({fn_args})[/dim]")
+            result = await self.registry.run(tc.name, **fn_args)
+
+            return {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            }
+
+        return list(await asyncio.gather(*[run_one(tc) for tc in tool_calls]))
+
+    @staticmethod
+    def _build_assistant_message(result) -> dict:
+        """Convert a StreamResult into the assistant message dict for history."""
+        msg: dict = {"role": "assistant", "content": result.content}
+        if result.has_tool_calls:
+            msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": tc.arguments},
+                }
+                for tc in result.tool_calls
+            ]
+        return msg
 
     # ── REPL ──────────────────────────────────────────────────────────────────
 
-    def chat(self):
-        """Start the interactive REPL."""
+    async def chat(self):
+        """Async interactive REPL — reads input in a thread to stay non-blocking."""
+        loop = asyncio.get_event_loop()
+
         while True:
             try:
-                user_input = console.input("[bold]You:[/bold] ").strip()
+                # Read input without blocking the event loop
+                user_input = await loop.run_in_executor(
+                    None, lambda: console.input("[bold]You:[/bold] ")
+                )
+                user_input = user_input.strip()
 
                 if not user_input:
                     continue
 
-                # Built-in slash commands
                 if user_input.lower() in ("/exit", "/quit"):
                     console.print("[yellow]Bye.[/yellow]")
                     break
@@ -128,11 +189,13 @@ class Agent:
                         console.print(f"  [bold]{cmd}[/bold]  {desc}")
                     continue
 
-                response = self.run_once(user_input)
-                console.print(Markdown(response))
+                await self.run_once(user_input)
 
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, EOFError):
                 console.print("\n[yellow]Bye.[/yellow]")
                 break
             except Exception as e:
                 console.print(f"[red]Error:[/red] {e}")
+
+    async def aclose(self):
+        await self.llm.aclose()

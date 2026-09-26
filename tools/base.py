@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 
 
 class BaseTool(ABC):
-    """Base interface that every callable tool must implement."""
+    """Base interface that every tool must implement. run() is async."""
 
     @property
     @abstractmethod
@@ -23,8 +23,8 @@ class BaseTool(ABC):
         ...
 
     @abstractmethod
-    def run(self, **kwargs) -> str:
-        """Execute the tool and return a string result."""
+    async def run(self, **kwargs) -> str:
+        """Execute the tool asynchronously and return a string result."""
         ...
 
     def to_openai_schema(self) -> dict:

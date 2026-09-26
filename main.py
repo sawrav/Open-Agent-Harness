@@ -1,10 +1,14 @@
+import asyncio
 from agent import Agent
 
 
-def main():
+async def main():
     agent = Agent()
-    agent.chat()
+    try:
+        await agent.chat()
+    finally:
+        await agent.aclose()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
