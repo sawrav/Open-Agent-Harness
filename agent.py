@@ -96,7 +96,16 @@ class Agent:
                 tools=self.registry.all_schemas(),
                 budget_tokens=config.THINKING_MODES[self._mode],
             ):
-                if kind == "reasoning":
+                if kind == "error":
+                    # Server-side error — print it and abort this turn cleanly
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    console.print(f"[red]Error:[/red] {token}")
+                    # Remove the user message we just appended so history stays clean
+                    if self.messages and self.messages[-1]["role"] == "user":
+                        self.messages.pop()
+                    return
+                elif kind == "reasoning":
                     if not in_reasoning:
                         sys.stdout.write("\n\033[2m<thinking>\n")  # dim on
                         in_reasoning = True
@@ -143,10 +152,34 @@ class Agent:
         """Run all tool calls concurrently and return tool result messages."""
 
         async def run_one(tc: ToolCallAccumulator) -> dict:
+            # Guard: skip tool calls with incomplete delta accumulation
+            if not tc.name or not tc.id:
+                console.print(f"  [red]⚠  Skipping malformed tool call (missing name or id)[/red]")
+                return {
+                    "role": "tool",
+                    "tool_call_id": tc.id or "unknown",
+                    "content": "Error: tool call was malformed (missing name or id) and was not executed.",
+                }
+
             try:
-                fn_args = json.loads(tc.arguments) if tc.arguments else {}
+                fn_args = json.loads(tc.arguments) if tc.arguments.strip() else {}
             except json.JSONDecodeError:
+                console.print(f"  [red]⚠  Could not parse arguments for {tc.name}: {tc.arguments!r}[/red]")
                 fn_args = {}
+
+            # Guard: check required parameters are present before dispatching
+            tool = self.registry.get(tc.name)
+            if tool:
+                required = tool.parameters.get("required", [])
+                missing = [p for p in required if p not in fn_args]
+                if missing:
+                    msg = f"Error: missing required parameter(s): {', '.join(missing)}"
+                    console.print(f"  [red]⚠  {tc.name}: {msg}[/red]")
+                    return {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": msg,
+                    }
 
             console.print(f"  [dim]⚙  {tc.name}({fn_args})[/dim]")
             result = await self.registry.run(tc.name, **fn_args)
