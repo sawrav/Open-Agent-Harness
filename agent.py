@@ -24,11 +24,12 @@ from registry import ToolRegistry
 console = Console()
 
 COMMANDS = {
-    "/tools":  "List all available callable tools",
-    "/skills": "List all loaded Markdown skills",
-    "/clear":  "Clear the conversation history (keeps system prompt)",
-    "/help":   "Show this help message",
-    "/exit":   "Quit the agent",
+    "/tools":       "List all available callable tools",
+    "/skills":      "List all loaded Markdown skills",
+    "/mode <name>": "Switch thinking mode: fast | medium | slow",
+    "/clear":       "Clear the conversation history (keeps system prompt)",
+    "/help":        "Show this help message",
+    "/exit":        "Quit the agent",
 }
 
 
@@ -42,12 +43,15 @@ class Agent:
         self.llm = LLMClient()
         self.registry = ToolRegistry()
         self.messages: list[dict] = []
+        self._mode: str = config.DEFAULT_THINKING_MODE
         self._reset_messages()
 
         console.print(
             f"\n[bold green]OpenAgentHarness ready.[/bold green]\n"
             f"  [dim]Tools :[/dim]  [cyan]{', '.join(self.registry.list_tools()) or 'none'}[/cyan]\n"
             f"  [dim]Skills:[/dim]  [magenta]{', '.join(self.registry.list_skills()) or 'none'}[/magenta]\n"
+            f"  [dim]Mode  :[/dim]  [yellow]{self._mode}[/yellow] "
+            f"[dim]({config.THINKING_MODES[self._mode]} budget tokens)[/dim]\n"
             f"  [dim]Type [bold]/help[/bold] for available commands.[/dim]\n"
         )
 
@@ -87,7 +91,11 @@ class Agent:
             # ── Stream tokens live ─────────────────────────────────────────────
             # Use raw sys.stdout throughout — rich buffers per-line and will
             # swallow the visual separation between thinking and content blocks.
-            async for kind, token in self.llm.stream(self.messages, tools=self.registry.all_schemas()):
+            async for kind, token in self.llm.stream(
+                self.messages,
+                tools=self.registry.all_schemas(),
+                budget_tokens=config.THINKING_MODES[self._mode],
+            ):
                 if kind == "reasoning":
                     if not in_reasoning:
                         sys.stdout.write("\n\033[2m<thinking>\n")  # dim on
@@ -197,6 +205,32 @@ class Agent:
                     console.print(f"[magenta]Skills:[/magenta] {', '.join(skills) if skills else 'none'}")
                     continue
 
+                elif user_input.lower().startswith("/mode"):
+                    parts = user_input.strip().split()
+                    if len(parts) == 1:
+                        # Print current mode and available options
+                        console.print(
+                            f"[yellow]Current mode:[/yellow] [bold]{self._mode}[/bold] "
+                            f"[dim]({config.THINKING_MODES[self._mode]} budget tokens)[/dim]"
+                        )
+                        console.print("[dim]Available modes:[/dim]")
+                        for name, tokens in config.THINKING_MODES.items():
+                            marker = " ◀" if name == self._mode else ""
+                            console.print(f"  [bold]{name}[/bold]  {tokens} budget tokens{marker}")
+                    else:
+                        requested = parts[1].lower()
+                        if requested not in config.THINKING_MODES:
+                            valid = ", ".join(config.THINKING_MODES.keys())
+                            console.print(f"[red]Unknown mode '{requested}'. Valid modes: {valid}[/red]")
+                        else:
+                            self._mode = requested
+                            budget = config.THINKING_MODES[self._mode]
+                            console.print(
+                                f"[yellow]Mode → [bold]{self._mode}[/bold][/yellow] "
+                                f"[dim]({budget} budget tokens)[/dim]"
+                            )
+                    continue
+
                 elif user_input.lower() == "/clear":
                     self._reset_messages()
                     console.print("[dim]Conversation cleared.[/dim]")
@@ -205,6 +239,10 @@ class Agent:
                 elif user_input.lower() == "/help":
                     for cmd, desc in COMMANDS.items():
                         console.print(f"  [bold]{cmd}[/bold]  {desc}")
+                    console.print(
+                        f"\n  [dim]Current mode:[/dim] [bold yellow]{self._mode}[/bold yellow] "
+                        f"[dim]({config.THINKING_MODES[self._mode]} budget tokens)[/dim]"
+                    )
                     continue
 
                 await self.run_once(user_input)
