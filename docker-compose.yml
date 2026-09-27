@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  agent-harness:
+    build: .
+    image: open-agent-harness:latest
+    container_name: open-agent-harness
+    # Map host current working directory into container for file tools
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock # optional, for nested docker if needed
+    environment:
+      - LLM_BASE_URL=http://host.docker.internal:8080/v1
+      # LLM_API_KEY can be overridden at runtime if needed
+    # Uncomment to run interactively
+    # stdin_open: true
+    # tty: true

@@ -1,4 +1,4 @@
-LLM_BASE_URL = "http://localhost:8080/v1"
+LLM_BASE_URL = "http://host.docker.internal:8080/v1"
 VLLM_BASE_URL = "http://localhost:8000/v1"
 LLM_API_KEY = "not-needed"
 LLM_MODEL = "local"
