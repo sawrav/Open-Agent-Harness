@@ -1,28 +1,26 @@
 """
-llm.py — vLLM based async streaming LLM client for OpenAgentHarness.
+llm.py — vLLM OpenAI-compatible async streaming client for OpenAgentHarness.
 
-Replaces llama.cpp httpx streaming with vLLM's LLM entrypoint for
-continuous batching, PagedAttention, chunked prefill and native streaming.
-Tool-call deltas are accumulated here and returned as structured data.
-API is kept compatible with existing agent.py.
+Uses httpx with raw SSE parsing against a vLLM OpenAI server
+http://localhost:8000/v1/chat/completions for true token-by-token
+streaming callbacks and native function calling. API is kept compatible
+with the previous llama.cpp client so agent.py needs no changes.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
-from vllm import LLM
-from vllm.entrypoints.llm import SamplingParams
+import httpx
 
 import config
 
 
 @dataclass
 class ToolCallAccumulator:
-    """Accumulates streamed tool-call fragments into a complete call."""
+    """Accumulates streamed tool-call delta fragments into a complete call."""
     index: int
     id: str = ""
     name: str = ""
@@ -42,48 +40,23 @@ class StreamResult:
 
 class LLMClient:
     """
-    vLLM async streaming client with llama.cpp compatible interface.
+    Async streaming client for vLLM OpenAI-compatible /v1/chat/completions.
 
     Yields (kind, token) tuples:
-      - kind == "reasoning" → thinking content
-      - kind == "content"   → final response
-      - kind == "error"     → error message
+      - kind == "reasoning"  → delta.reasoning_content if model emits it
+      - kind == "content"    → delta.content
+      - kind == "error"      → connection/server error
     """
 
     def __init__(self):
-        model_name = getattr(config, "LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-        if model_name == "local":
-            model_name = "Qwen/Qwen2.5-7B-Instruct"
-
-        self._llm = LLM(
-            model=model_name,
-            tensor_parallel_size=1,
-            gpu_memory_utilization=0.9,
-            max_model_len=getattr(config, "CTX_SIZE", 16384),
-            max_num_seqs=256,
-            enable_chunked_prefill=True,
-            dtype="auto",
-        )
-        self._default_sampling = SamplingParams(
-            temperature=0.2,
-            top_p=0.95,
-            top_k=40,
-            max_tokens=getattr(config, "MAX_TOKENS", {"medium": 3072})["medium"],
+        # vLLM OpenAI server default; override via config if needed
+        base_url = getattr(config, "VLLM_BASE_URL", config.LLM_BASE_URL)
+        self._http = httpx.AsyncClient(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=5.0),
         )
         self._last_result: StreamResult | None = None
-
-    def _messages_to_prompt(self, messages: list[dict]) -> str:
-        try:
-            return self._llm.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        except Exception:
-            parts = []
-            for m in messages:
-                role = m.get("role", "user")
-                content = m.get("content", "")
-                parts.append(f"{role}: {content}")
-            return "\n".join(parts)
 
     async def stream(
         self,
@@ -92,43 +65,106 @@ class LLMClient:
         budget_tokens: int | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
-        """
-        Stream tokens from vLLM with continuous batching.
+        model_name = getattr(config, "VLLM_MODEL", getattr(config, "LLM_MODEL", "local"))
+        payload: dict = {
+            "model": model_name,
+            "messages": messages,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
-        tools param is accepted for API compatibility. Full function calling
-        requires guided decoding setup; for now tool_calls are empty.
-        """
-        prompt = self._messages_to_prompt(messages)
+        # vLLM supports OpenAI style reasoning params for some models
+        if budget_tokens is not None:
+            if budget_tokens > 0:
+                payload["extra_body"] = {"thinking": {"type": "enabled", "budget_tokens": budget_tokens}}
+            else:
+                payload["extra_body"] = {"thinking": {"type": "disabled"}}
 
-        sampling = SamplingParams(
-            temperature=self._default_sampling.temperature,
-            top_p=self._default_sampling.top_p,
-            top_k=self._default_sampling.top_k,
-            max_tokens=max_tokens or self._default_sampling.max_tokens,
-        )
+        content_parts: list[str] = []
+        tool_accumulators: dict[int, ToolCallAccumulator] = {}
 
         try:
-            def _gen():
-                return self._llm.generate([prompt], sampling_params=sampling, use_tqdm=False)
+            async with self._http.stream("POST", "/chat/completions", json=payload) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    error_text = body.decode(errors="replace")[:500]
+                    yield ("error", f"Server error {resp.status_code}: {error_text}")
+                    self._last_result = StreamResult(content="", tool_calls=[])
+                    return
 
-            outputs = await asyncio.to_thread(_gen)
-            full_text = ""
-            for out in outputs:
-                text = out.outputs[0].text
-                full_text += text
-                for ch in text:
-                    yield ("content", ch)
-            self._last_result = StreamResult(content=full_text, tool_calls=[])
-        except Exception as e:
-            yield ("error", f"vLLM error: {e}")
+                async for raw_line in resp.aiter_lines():
+                    if not raw_line.startswith("data:"):
+                        continue
+                    data = raw_line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices")
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+
+                    # Reasoning token
+                    reasoning_token = delta.get("reasoning_content")
+                    if reasoning_token:
+                        yield ("reasoning", reasoning_token)
+
+                    # Content token
+                    token = delta.get("content")
+                    if token:
+                        content_parts.append(token)
+                        yield ("content", token)
+
+                    # Tool call deltas
+                    for tc_delta in delta.get("tool_calls", []):
+                        idx = tc_delta.get("index", 0)
+                        if idx not in tool_accumulators:
+                            tool_accumulators[idx] = ToolCallAccumulator(index=idx)
+                        acc = tool_accumulators[idx]
+                        if tc_delta.get("id"):
+                            acc.id += tc_delta["id"]
+                        fn = tc_delta.get("function", {})
+                        if fn.get("name"):
+                            acc.name += fn["name"]
+                        if fn.get("arguments"):
+                            acc.arguments += fn["arguments"]
+
+        except httpx.ConnectError:
+            yield ("error", (
+                f"Cannot connect to vLLM server at {self._http.base_url}. "
+                "Start vLLM OpenAI server with:\n"
+                f"  vllm serve {model_name} --port 8000"
+            ))
             self._last_result = StreamResult(content="", tool_calls=[])
+            return
+        except httpx.ReadTimeout:
+            yield ("error", "Request timed out — model overloaded or prompt too large.")
+            self._last_result = StreamResult(content="", tool_calls=[])
+            return
+        except Exception as e:
+            yield ("error", f"Unexpected error: {e}")
+            self._last_result = StreamResult(content="", tool_calls=[])
+            return
+
+        self._last_result = StreamResult(
+            content="".join(content_parts),
+            tool_calls=list(tool_accumulators.values()),
+        )
 
     @property
     def last_result(self) -> StreamResult | None:
         return self._last_result
 
     async def aclose(self):
-        pass
+        await self._http.aclose()
 
     async def __aenter__(self):
         return self

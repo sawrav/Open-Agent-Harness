@@ -1,6 +1,8 @@
 LLM_BASE_URL = "http://localhost:8080/v1"
+VLLM_BASE_URL = "http://localhost:8000/v1"
 LLM_API_KEY = "not-needed"
 LLM_MODEL = "local"
+VLLM_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 CTX_SIZE = 16384          # must match --ctx-size passed to llama-server
 SYSTEM_PROMPT = (
     "You are a helpful assistant with access to tools. "
