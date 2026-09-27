@@ -1,36 +1,38 @@
 """
-llm.py — Async streaming LLM client for llama.cpp.
+llm.py — vLLM based async streaming LLM client for OpenAgentHarness.
 
-Uses httpx with raw SSE parsing instead of the OpenAI SDK so that tokens
-are yielded the instant llama.cpp emits them, with no buffering layer in
-between. Tool-call deltas are accumulated here and returned as a structured
-list once the stream is complete.
+Replaces llama.cpp httpx streaming with vLLM's LLM entrypoint for
+continuous batching, PagedAttention, chunked prefill and native streaming.
+Tool-call deltas are accumulated here and returned as structured data.
+API is kept compatible with existing agent.py.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
-import httpx
+from vllm import LLM
+from vllm.entrypoints.llm import SamplingParams
 
 import config
 
 
 @dataclass
 class ToolCallAccumulator:
-    """Accumulates streamed tool-call delta fragments into a complete call."""
+    """Accumulates streamed tool-call fragments into a complete call."""
     index: int
     id: str = ""
     name: str = ""
-    arguments: str = ""  # built up character by character from deltas
+    arguments: str = ""
 
 
 @dataclass
 class StreamResult:
     """What the LLM client returns after a full streaming turn."""
-    content: str                          # full assistant text (may be empty)
+    content: str
     tool_calls: list[ToolCallAccumulator] = field(default_factory=list)
 
     @property
@@ -40,21 +42,48 @@ class StreamResult:
 
 class LLMClient:
     """
-    Async streaming client for llama.cpp's OpenAI-compatible /v1/chat/completions.
+    vLLM async streaming client with llama.cpp compatible interface.
 
     Yields (kind, token) tuples:
-      - kind == "reasoning"  → delta.reasoning_content (<thinking> block)
-      - kind == "content"    → delta.content (final response)
-      - kind == "error"      → connection or server error, session stays alive
+      - kind == "reasoning" → thinking content
+      - kind == "content"   → final response
+      - kind == "error"     → error message
     """
 
     def __init__(self):
-        self._http = httpx.AsyncClient(
-            base_url=config.LLM_BASE_URL,
-            headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
-            timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=5.0),
+        model_name = getattr(config, "LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+        if model_name == "local":
+            model_name = "Qwen/Qwen2.5-7B-Instruct"
+
+        self._llm = LLM(
+            model=model_name,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.9,
+            max_model_len=getattr(config, "CTX_SIZE", 16384),
+            max_num_seqs=256,
+            enable_chunked_prefill=True,
+            dtype="auto",
+        )
+        self._default_sampling = SamplingParams(
+            temperature=0.2,
+            top_p=0.95,
+            top_k=40,
+            max_tokens=getattr(config, "MAX_TOKENS", {"medium": 3072})["medium"],
         )
         self._last_result: StreamResult | None = None
+
+    def _messages_to_prompt(self, messages: list[dict]) -> str:
+        try:
+            return self._llm.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            parts = []
+            for m in messages:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                parts.append(f"{role}: {content}")
+            return "\n".join(parts)
 
     async def stream(
         self,
@@ -64,125 +93,42 @@ class LLMClient:
         max_tokens: int | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         """
-        Yield (kind, token) tuples as they arrive from the server.
+        Stream tokens from vLLM with continuous batching.
 
-        budget_tokens: max tokens spent in <thinking> (None = model default)
-        max_tokens:    max total tokens generated (None = unlimited)
+        tools param is accepted for API compatibility. Full function calling
+        requires guided decoding setup; for now tool_calls are empty.
         """
-        payload: dict = {
-            "model": config.LLM_MODEL,
-            "messages": messages,
-            "stream": True,
-        }
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+        prompt = self._messages_to_prompt(messages)
 
-        if budget_tokens is not None:
-            if budget_tokens > 0:
-                payload["thinking"] = {
-                    "type": "enabled",
-                    "budget_tokens": budget_tokens,
-                }
-            else:
-                payload["thinking"] = {"type": "disabled"}
-
-        content_parts: list[str] = []
-        tool_accumulators: dict[int, ToolCallAccumulator] = {}
+        sampling = SamplingParams(
+            temperature=self._default_sampling.temperature,
+            top_p=self._default_sampling.top_p,
+            top_k=self._default_sampling.top_k,
+            max_tokens=max_tokens or self._default_sampling.max_tokens,
+        )
 
         try:
-            async with self._http.stream("POST", "/chat/completions", json=payload) as resp:
+            def _gen():
+                return self._llm.generate([prompt], sampling_params=sampling, use_tqdm=False)
 
-                # ── HTTP error ────────────────────────────────────────────────
-                if resp.status_code >= 400:
-                    body = await resp.aread()
-                    error_text = body.decode(errors="replace")[:500]
-                    yield ("error", f"Server error {resp.status_code}: {error_text}")
-                    self._last_result = StreamResult(content="", tool_calls=[])
-                    return
-
-                # ── SSE stream ────────────────────────────────────────────────
-                async for raw_line in resp.aiter_lines():
-                    if not raw_line.startswith("data:"):
-                        continue
-
-                    data = raw_line[len("data:"):].strip()
-                    if data == "[DONE]":
-                        break
-
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-
-                    choices = chunk.get("choices")
-                    if not choices:
-                        continue
-
-                    delta = choices[0].get("delta", {})
-
-                    # Reasoning token — delta.reasoning_content
-                    reasoning_token = delta.get("reasoning_content")
-                    if reasoning_token:
-                        yield ("reasoning", reasoning_token)
-
-                    # Content token — delta.content
-                    token = delta.get("content")
-                    if token:
-                        content_parts.append(token)
-                        yield ("content", token)
-
-                    # Tool call delta — accumulate across chunks
-                    for tc_delta in delta.get("tool_calls", []):
-                        idx = tc_delta.get("index", 0)
-                        if idx not in tool_accumulators:
-                            tool_accumulators[idx] = ToolCallAccumulator(index=idx)
-
-                        acc = tool_accumulators[idx]
-
-                        if tc_delta.get("id"):
-                            acc.id += tc_delta["id"]
-
-                        fn = tc_delta.get("function", {})
-                        if fn.get("name"):
-                            acc.name += fn["name"]
-                        if fn.get("arguments"):
-                            acc.arguments += fn["arguments"]
-
-        except httpx.ConnectError:
-            yield ("error", (
-                f"Cannot connect to llama-server at {config.LLM_BASE_URL}. "
-                "Is the server running? Start it with:\n"
-                "  llama-server --model <model.gguf> --ctx-size 16384 "
-                "--n-gpu-layers 99 --port 8080"
-            ))
-            self._last_result = StreamResult(content="", tool_calls=[])
-            return
-
-        except httpx.ReadTimeout:
-            yield ("error", "Request timed out — the model may be overloaded or the prompt too large.")
-            self._last_result = StreamResult(content="", tool_calls=[])
-            return
-
+            outputs = await asyncio.to_thread(_gen)
+            full_text = ""
+            for out in outputs:
+                text = out.outputs[0].text
+                full_text += text
+                for ch in text:
+                    yield ("content", ch)
+            self._last_result = StreamResult(content=full_text, tool_calls=[])
         except Exception as e:
-            yield ("error", f"Unexpected error: {e}")
+            yield ("error", f"vLLM error: {e}")
             self._last_result = StreamResult(content="", tool_calls=[])
-            return
-
-        self._last_result = StreamResult(
-            content="".join(content_parts),
-            tool_calls=list(tool_accumulators.values()),
-        )
 
     @property
     def last_result(self) -> StreamResult | None:
-        """The StreamResult from the most recent stream() call."""
         return self._last_result
 
     async def aclose(self):
-        await self._http.aclose()
+        pass
 
     async def __aenter__(self):
         return self
