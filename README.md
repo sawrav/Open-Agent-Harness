@@ -1,8 +1,7 @@
-# OpenAgentHarness
+# Open-Agent-Harness
 
-A lightweight, extensible agentic harness for running local LLMs via
-[llama.cpp](https://github.com/ggerganov/llama.cpp). Fully async, token-streaming,
-with tool-calling, thinking mode control, and automatic memory compaction.
+A lightweight, extensible agentic harness for running local sympathetic LLMs (having mechanical sympathy!) via
+[llama.cpp](https://github.com/ggerganov/llama.cpp). Fully async, token-streaming, with tool-calling, thinking mode control, and automatic memory compaction.
 
 **Live site:** `https://github.com/sawrav/Open-Agent-Harness`
 
