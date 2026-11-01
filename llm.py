@@ -9,6 +9,12 @@ Muse, Mistral, Qwen, DeepSeek, etc.
 Model capability flags in config.py control which optional API fields are sent:
   - ENABLE_THINKING   — budget_tokens for reasoning models (QwQ, DeepSeek-R1, …)
   - TOOL_CALL_SUPPORTED — whether tools/functions are advertised to the model
+
+Improvements:
+- Better error handling for connection issues
+- Improved timeout handling
+- Enhanced logging for debugging
+- Proper cleanup on errors
 """
 
 from __future__ import annotations

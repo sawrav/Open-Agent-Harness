@@ -5,6 +5,14 @@ Tokens are printed to the terminal the instant the model emits them.
 Tool calls are accumulated from streaming deltas, executed concurrently
 (when multiple tools are called in one turn), then results are fed back
 for the next LLM turn — all within a single asyncio event loop.
+
+Improvements:
+- Added error handling for malformed tool calls (missing name/id)
+- Added parameter validation before tool dispatch
+- Improved tool round management with soft/hard caps
+- Added overflow recovery with automatic compaction and retry
+- Added automatic continuation after compaction
+- Enhanced error messages for JSON parsing failures
 """
 
 from __future__ import annotations

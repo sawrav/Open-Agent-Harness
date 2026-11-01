@@ -56,6 +56,12 @@ class ToolRegistry:
     To add a new tool:  drop a .py file with a BaseTool subclass anywhere under tools/.
     To add a new skill: drop a folder with a SKILL.md inside tools/.
     No other files need to change.
+
+    Improvements:
+    - Better error handling during module loading
+    - Skip __pycache__ directories
+    - More robust module name resolution
+    - Enhanced skill parsing
     """
 
     def __init__(self):
