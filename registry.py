@@ -2,10 +2,12 @@ import importlib
 import inspect
 import os
 import re
+import sys
 from typing import Optional
 
 from tools.base import BaseTool
 import tools as _tools_pkg
+import config
 
 
 def _parse_skill_md(path: str) -> dict | None:
@@ -56,6 +58,13 @@ class ToolRegistry:
     To add a new tool:  drop a .py file with a BaseTool subclass anywhere under tools/.
     To add a new skill: drop a folder with a SKILL.md inside tools/.
     No other files need to change.
+
+    Improvements:
+    - Better error handling during module loading
+    - Skip __pycache__ directories
+    - More robust module name resolution
+    - Enhanced skill parsing
+    - Support for EXTRA_TOOL_PATHS from config
     """
 
     def __init__(self):
@@ -67,8 +76,26 @@ class ToolRegistry:
 
     def _autodiscover(self):
         """Recursively scan tools/ for Python tools and SKILL.md files."""
-        tools_dir = os.path.dirname(_tools_pkg.__file__)
+        # Discover from default tools directory
+        default_tools_dir = os.path.dirname(_tools_pkg.__file__)
+        self._scan_directory(default_tools_dir, is_default=True)
+        
+        # Discover from extra paths
+        for extra_path in config.EXTRA_TOOL_PATHS:
+            extra_path = os.path.expanduser(extra_path)
+            if os.path.exists(extra_path):
+                self._scan_directory(extra_path, is_default=False)
+            else:
+                print(f"[registry] Extra tool path does not exist: {extra_path}")
 
+    def _scan_directory(self, tools_dir: str, is_default: bool = True):
+        """Scan a directory for tools and skills."""
+        if not os.path.isdir(tools_dir):
+            return
+            
+        source_label = "default" if is_default else f"extra ({tools_dir})"
+        print(f"[registry] Scanning {source_label} tools directory: {tools_dir}")
+        
         for root, dirs, files in os.walk(tools_dir):
             # Skip __pycache__ directories
             dirs[:] = [d for d in dirs if d != "__pycache__"]
@@ -77,29 +104,40 @@ class ToolRegistry:
                 filepath = os.path.join(root, filename)
 
                 if filename.endswith(".py") and filename not in ("__init__.py", "base.py"):
-                    self._load_python_module(filepath)
+                    self._load_python_module(filepath, tools_dir)
 
                 elif filename == "SKILL.md":
                     skill = _parse_skill_md(filepath)
                     if skill:
                         self._skills.append(skill)
 
-    def _load_python_module(self, filepath: str):
+    def _load_python_module(self, filepath: str, base_dir: str):
         """Import a .py file and register any BaseTool subclasses found in it."""
-        tools_dir = os.path.dirname(_tools_pkg.__file__)
-        # Build dotted module name relative to the parent of tools/
-        # e.g. /…/tools/git/tool.py  →  tools.git.tool
-        rel = os.path.relpath(filepath, os.path.dirname(tools_dir))
-        module_name = rel.replace(os.sep, ".")[:-3]  # strip .py
-
+        # Build module name based on relative path
         try:
+            rel_path = os.path.relpath(filepath, base_dir)
+            module_name = rel_path.replace(os.sep, ".")[:-3]  # strip .py
+            
+            # For extra paths, we need to make them importable
+            # Add base_dir to sys.path if it's not already there
+            if base_dir not in sys.path:
+                sys.path.insert(0, base_dir)
+            
+            # Create a unique module name to avoid conflicts
+            if base_dir != os.path.dirname(_tools_pkg.__file__):
+                # Extra path - use a unique prefix
+                module_name = f"extra_tools.{module_name}"
+            
             module = importlib.import_module(module_name)
             for _, obj in inspect.getmembers(module, inspect.isclass):
                 if issubclass(obj, BaseTool) and obj is not BaseTool:
                     instance = obj()
+                    if instance.name in self._tools:
+                        print(f"[registry] Warning: tool '{instance.name}' already exists, overwriting")
                     self._tools[instance.name] = instance
+                    print(f"[registry] Loaded tool: {instance.name} from {filepath}")
         except Exception as e:
-            print(f"[registry] Failed to load {module_name}: {e}")
+            print(f"[registry] Failed to load {filepath}: {e}")
 
     # ── Tool access ───────────────────────────────────────────────────────────
 
