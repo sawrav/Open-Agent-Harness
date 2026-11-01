@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 
 from tools.base import BaseTool
@@ -31,7 +32,14 @@ class ReadFileTool(BaseTool):
 
 class WriteFileTool(BaseTool):
     name = "write_file"
-    description = "Write content to a file, creating the file and parent directories if needed."
+    description = (
+        "Write content to a file, creating the file and parent directories if needed. "
+        "The content field accepts plain UTF-8 text. "
+        "For files containing quotes, backslashes, or code, encode the content as "
+        "standard base64 and set encoding to \"base64\" — this avoids JSON escaping "
+        "issues entirely. "
+        "When writing source code or config files, always use base64 encoding."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -41,20 +49,44 @@ class WriteFileTool(BaseTool):
             },
             "content": {
                 "type": "string",
-                "description": "Text content to write.",
+                "description": (
+                    "File content. Plain UTF-8 text, or base64-encoded bytes "
+                    "when encoding is set to \"base64\"."
+                ),
+            },
+            "encoding": {
+                "type": "string",
+                "enum": ["utf-8", "base64"],
+                "description": (
+                    "How content is encoded. Use \"base64\" for any file that "
+                    "contains quotes, backslashes, or code to avoid JSON escaping "
+                    "problems. Defaults to \"utf-8\"."
+                ),
             },
         },
         "required": ["path", "content"],
     }
 
-    async def run(self, path: str, content: str) -> str:
+    async def run(self, path: str, content: str, encoding: str = "utf-8") -> str:
         path = os.path.expanduser(path)
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
+
+        # Decode base64 if the model chose that encoding
+        if encoding == "base64":
+            try:
+                raw_bytes = base64.b64decode(content)
+                decoded = raw_bytes.decode("utf-8")
+            except Exception as e:
+                return f"Error: could not decode base64 content: {e}"
+            write_content = decoded
+        else:
+            write_content = content
+
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _write_sync, path, content)
-        return f"Wrote {len(content)} bytes to {path}"
+        await loop.run_in_executor(None, _write_sync, path, write_content)
+        return f"Wrote {len(write_content)} bytes to {path}"
 
 
 class ListDirectoryTool(BaseTool):

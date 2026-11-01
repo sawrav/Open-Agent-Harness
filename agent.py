@@ -242,9 +242,25 @@ class Agent:
 
             try:
                 fn_args = json.loads(tc.arguments) if tc.arguments.strip() else {}
-            except json.JSONDecodeError:
-                console.print(f"  [red]⚠  Could not parse arguments for {tc.name}: {tc.arguments!r}[/red]")
-                fn_args = {}
+            except json.JSONDecodeError as exc:
+                # The model produced malformed JSON — most commonly double-escaped
+                # quotes or backslashes when writing file content inline.
+                # Return a structured error so the model can retry with base64.
+                snippet = tc.arguments[:120].replace("\n", "\\n")
+                msg = (
+                    f"Error: could not parse tool arguments as JSON "
+                    f"(at char {exc.pos}: {exc.msg}). "
+                    f"Arguments started with: {snippet!r}. "
+                    "If you are writing file content that contains quotes, "
+                    "backslashes, or source code, encode the content as standard "
+                    "base64 and set encoding=\"base64\" to avoid JSON escaping issues."
+                )
+                console.print(f"  [red]⚠  {tc.name}: JSON parse failed at char {exc.pos} — {exc.msg}[/red]")
+                return {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": msg,
+                }
 
             # Guard: check required parameters are present before dispatching
             tool = self.registry.get(tc.name)
