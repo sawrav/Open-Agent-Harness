@@ -1,39 +1,95 @@
-LLM_BASE_URL = "http://host.docker.internal:8080/v1"
-VLLM_BASE_URL = "http://localhost:8000/v1"
-LLM_API_KEY = "not-needed"
-LLM_MODEL = "local"
-VLLM_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-CTX_SIZE = 16384          # must match --ctx-size passed to llama-server
-SYSTEM_PROMPT = (
+"""
+All configuration for OpenAgentHarness.
+
+Every value can be overridden at runtime via an environment variable of the
+same name, making the harness work against any open-weight model without
+editing this file:
+
+    python main.py                                                    # Muse Glimmer 30B (default)
+    VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct ENABLE_THINKING=false python main.py
+    VLLM_MODEL=Qwen/QwQ-32B VLLM_BASE_URL=http://10.0.0.5:8000/v1 python main.py
+"""
+
+import os
+
+def _env(key: str, default: str) -> str:
+    return os.environ.get(key, default)
+
+def _env_int(key: str, default: int) -> int:
+    return int(os.environ.get(key, default))
+
+def _env_bool(key: str, default: bool) -> bool:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes")
+
+
+# ── Server ────────────────────────────────────────────────────────────────────
+
+# Base URL of the vLLM OpenAI-compatible server.  Must end in /v1.
+VLLM_BASE_URL: str = _env("VLLM_BASE_URL", "http://localhost:8000/v1")
+
+# API key sent as Bearer token.  Set to match --api-key on the vLLM server.
+# Leave as "not-needed" for unauthenticated servers.
+LLM_API_KEY: str = _env("LLM_API_KEY", "not-needed")
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+
+# Hugging Face model ID (or local path) that matches what vLLM was started with.
+# Default: Muse Glimmer 30B — Meta's on-device agentic reasoning model.
+#   Context window : 131,072 tokens
+#   Thinking       : always-on (reasoning_content emitted on every turn)
+#   Tool calling   : first-class, purpose-built for agentic workflows
+#   VRAM           : ~17 GB at Q4_K_M (fits 24 GB GPU)
+#   vLLM launch    : vllm serve meta-models/Muse-Glimmer-30B
+#
+# Other examples:
+#   meta-llama/Llama-3.1-8B-Instruct       (ENABLE_THINKING=false)
+#   meta-llama/Llama-3.3-70B-Instruct      (ENABLE_THINKING=false)
+#   mistralai/Mistral-7B-Instruct-v0.3     (ENABLE_THINKING=false)
+#   Qwen/Qwen2.5-7B-Instruct               (ENABLE_THINKING=false)
+#   Qwen/QwQ-32B                           (ENABLE_THINKING=true)
+#   deepseek-ai/DeepSeek-R1-Distill-Qwen-14B  (ENABLE_THINKING=true)
+VLLM_MODEL: str = _env("VLLM_MODEL", "meta-models/Muse-Glimmer-30B")
+
+# Context window size in tokens.  Must match --max-model-len on the vLLM server
+# (or the model default if --max-model-len is omitted).
+CTX_SIZE: int = _env_int("CTX_SIZE", 131072)
+
+# ── Model capability flags ────────────────────────────────────────────────────
+# These guard model-specific API fields so other models are not sent parameters
+# they do not support.
+
+# Enable extended thinking / chain-of-thought reasoning tokens.
+# Muse Glimmer always emits reasoning_content — thinking is always on by default.
+# Set to false only for non-reasoning instruct models (Llama, Mistral, standard Qwen).
+ENABLE_THINKING: bool = _env_bool("ENABLE_THINKING", True)
+
+# Set to false for base (non-instruct) models not fine-tuned for function calling.
+# When false, no tools are advertised to the model at all.
+TOOL_CALL_SUPPORTED: bool = _env_bool("TOOL_CALL_SUPPORTED", True)
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT: str = (
     "You are a helpful assistant with access to tools. "
     "Use them when needed to answer the user's request accurately."
 )
 
-# ── Generation limits ─────────────────────────────────────────────────────────
-# Max tokens the model may generate per response (thinking + content combined).
-# -1 = unlimited (default llama.cpp behaviour, can cause very long thinking blocks).
-# Set a sensible cap to prevent runaway generation.
-MAX_TOKENS: dict[str, int] = {
-    "fast":   1024,
-    "medium": 4096,
-    "slow":   8192,
-}
-
 # ── Thinking / research modes ─────────────────────────────────────────────────
-# budget_tokens: max tokens the model may spend in <thinking> before responding.
-# Must stay well under CTX_SIZE — the prompt + tool results also consume tokens.
-# Rule of thumb: budget_tokens <= CTX_SIZE // 4 to leave room for prompt + output.
+# budget_tokens: maximum tokens the model may spend inside <thinking>.
+# Only applied when ENABLE_THINKING=true.
+# Rule of thumb: budget_tokens <= CTX_SIZE // 8 to leave room for prompt + output.
 THINKING_MODES: dict[str, int] = {
     "fast":   512,
     "medium": 2048,
-    "slow":   4096,   # was 16384, which equalled the entire context window
+    "slow":   4096,
 }
-DEFAULT_THINKING_MODE = "medium"
+DEFAULT_THINKING_MODE: str = "medium"
 
 # ── Generation limits ─────────────────────────────────────────────────────────
-# Hard ceiling on total tokens generated per response (thinking + content).
+# Hard ceiling on total tokens generated per response (thinking + content combined).
 # budget_tokens + max_tokens must leave room for the prompt in the context window.
-# With CTX_SIZE=16384 and ~4-6K typical prompt, max_tokens should be <= 8-10K.
 MAX_TOKENS: dict[str, int] = {
     "fast":   1024,
     "medium": 3072,
@@ -42,13 +98,14 @@ MAX_TOKENS: dict[str, int] = {
 
 # ── Context window management ─────────────────────────────────────────────────
 # Trigger message compression when token usage exceeds this fraction of CTX_SIZE.
-CTX_COMPRESS_THRESHOLD = 0.80   # 80% — compress earlier to stay ahead of overflow
-
-# Characters-per-token estimate for fallback token counting (when /tokenize unavailable).
-CHARS_PER_TOKEN = 4
+CTX_COMPRESS_THRESHOLD: float = 0.80   # compact at 80% to stay ahead of overflow
 
 # Keep the last N user/assistant pairs verbatim during compression.
-CTX_COMPRESS_KEEP_RECENT = 4
+CTX_COMPRESS_KEEP_RECENT: int = 4
 
 # Also trigger auto-compaction every N accumulated tokens regardless of threshold.
-CTX_COMPACT_INTERVAL = 20_000
+CTX_COMPACT_INTERVAL: int = 20_000
+
+# Characters-per-token estimate for fallback token counting.
+# Used when the /v1/tokenize endpoint is unavailable.
+CHARS_PER_TOKEN: int = 4

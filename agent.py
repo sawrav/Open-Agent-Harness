@@ -51,10 +51,21 @@ class Agent:
 
         console.print(
             f"\n[bold green]OpenAgentHarness ready.[/bold green]\n"
-            f"  [dim]Tools :[/dim]  [cyan]{', '.join(self.registry.list_tools()) or 'none'}[/cyan]\n"
+            f"  [dim]Model :[/dim]  [cyan]{config.VLLM_MODEL}[/cyan]\n"
+            f"  [dim]Tools :[/dim]  "
+            + (
+                f"[cyan]{', '.join(self.registry.list_tools()) or 'none'}[/cyan]"
+                if config.TOOL_CALL_SUPPORTED
+                else "[dim]disabled (TOOL_CALL_SUPPORTED=false)[/dim]"
+            ) + "\n"
             f"  [dim]Skills:[/dim]  [magenta]{', '.join(self.registry.list_skills()) or 'none'}[/magenta]\n"
             f"  [dim]Mode  :[/dim]  [yellow]{self._mode}[/yellow] "
-            f"[dim]({config.THINKING_MODES[self._mode]} budget tokens)[/dim]\n"
+            f"[dim]({config.THINKING_MODES[self._mode]} budget tokens)[/dim]"
+            + (
+                ""
+                if config.ENABLE_THINKING
+                else " [dim](thinking disabled — set ENABLE_THINKING=true for reasoning models)[/dim]"
+            ) + "\n"
             f"  [dim]Type [bold]/help[/bold] for available commands.[/dim]\n"
         )
 
@@ -108,7 +119,7 @@ class Agent:
             # swallow the visual separation between thinking and content blocks.
             async for kind, token in self.llm.stream(
                 self.messages,
-                tools=self.registry.all_schemas(),
+                tools=self.registry.all_schemas() if config.TOOL_CALL_SUPPORTED else None,
                 budget_tokens=config.THINKING_MODES[self._mode],
                 max_tokens=config.MAX_TOKENS[self._mode],
             ):

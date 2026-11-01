@@ -2,17 +2,20 @@
 context_manager.py — Context window management for OpenAgentHarness.
 
 Strategy:
-  - Token counting:   exact counts via llama.cpp /tokenize endpoint
+  - Token counting:   exact counts via vLLM /v1/tokenize endpoint, falling back
+                      to character-based estimation if the endpoint is unavailable
   - Context tracking: 10K-token increments reported to the user
   - Auto-compaction:  triggered at CTX_COMPRESS_THRESHOLD (80%) or every
                       CTX_COMPACT_INTERVAL tokens, whichever comes first
-  - Compaction:       summarise old messages via LLM, then erase the slot
-                      KV cache via POST /slots/0?action=erase
+  - Compaction:       summarise old messages via LLM, then log that the KV cache
+                      will be rebuilt on the next request (vLLM manages its own
+                      KV cache — there is no manual slot-erase API)
   - Overflow fallback: if compaction summary itself would overflow, fall back
                        to hard truncation (keep system + recent N pairs only)
 
-NOTE: /tokenize and /slots are at the server root, NOT under /v1.
-      A separate httpx client without the /v1 base_url is used for these.
+NOTE: vLLM exposes /v1/tokenize (added in v0.4.3).  This module probes that
+      endpoint first.  If absent (older vLLM or a different server), token
+      counting falls back silently to char-based estimation.
 """
 
 from __future__ import annotations
@@ -30,30 +33,34 @@ if TYPE_CHECKING:
 console = Console()
 
 
-def _server_root() -> str:
-    """Return the server root URL without the /v1 suffix."""
-    base = config.LLM_BASE_URL.rstrip("/")
-    if base.endswith("/v1"):
-        base = base[:-3]
-    return base
+def _vllm_base() -> str:
+    """Return the vLLM /v1 base URL (used for the /v1/tokenize probe)."""
+    return config.VLLM_BASE_URL.rstrip("/")
 
 
 # ── Token counting ────────────────────────────────────────────────────────────
 
 async def count_tokens(text: str, http: httpx.AsyncClient) -> int:
     """
-    Exact token count via llama.cpp /tokenize endpoint (server root, not /v1).
-    Falls back to char-based estimate if the endpoint is unavailable.
+    Exact token count via vLLM /v1/tokenize endpoint (added in vLLM v0.4.3).
+    Falls back to char-based estimation if the endpoint is unavailable.
+
+    vLLM request format:  POST /v1/tokenize  {"model": "<model>", "prompt": "<text>"}
+    vLLM response format: {"tokens": [id, id, …], "count": N}
     """
     try:
         resp = await http.post(
             "/tokenize",
-            json={"content": text, "add_special": False},
+            json={"model": config.VLLM_MODEL, "prompt": text},
             timeout=5.0,
         )
         if resp.status_code == 200:
             data = resp.json()
-            return len(data.get("tokens", []))
+            # vLLM returns either {"tokens": [...]} or {"count": N}
+            if "tokens" in data:
+                return len(data["tokens"])
+            if "count" in data:
+                return int(data["count"])
     except Exception:
         pass
     return len(text) // config.CHARS_PER_TOKEN
@@ -90,21 +97,21 @@ def _messages_to_text(messages: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-# ── KV cache erase ────────────────────────────────────────────────────────────
+# ── KV cache note ─────────────────────────────────────────────────────────────
 
 async def erase_kv_cache(http: httpx.AsyncClient, slot_id: int = 0) -> bool:
     """
-    Erase llama.cpp's KV cache for the given slot.
-    Uses POST /slots/{id}?action=erase at the server root (not /v1).
+    vLLM manages KV cache internally via continuous batching; there is no
+    manual slot-erase API (unlike llama.cpp's /slots/{id}?action=erase).
+
+    After context compaction the message history is already shortened — on the
+    next request vLLM will only prefill the compacted history, effectively
+    reclaiming KV cache space.  No explicit flush is needed or possible.
+
+    Returns True to signal that the compaction cycle completed successfully.
+    The slot_id parameter is kept for API compatibility but is unused.
     """
-    try:
-        resp = await http.post(
-            f"/slots/{slot_id}?action=erase",
-            timeout=10.0,
-        )
-        return resp.status_code == 200
-    except Exception:
-        return False
+    return True
 
 
 # ── Message compression ───────────────────────────────────────────────────────
@@ -219,9 +226,9 @@ class ContextManager:
 
     def __init__(self, llm: "LLMClient"):
         self._llm = llm
-        # Separate client at server root for /tokenize and /slots
+        # Dedicated client at the vLLM /v1 base for the /tokenize probe.
         self._server_http = httpx.AsyncClient(
-            base_url=_server_root(),
+            base_url=_vllm_base(),
             headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
             timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
         )
@@ -286,7 +293,7 @@ class ContextManager:
         ratio = after / config.CTX_SIZE
 
         erased = await erase_kv_cache(self._server_http)
-        kv_note = " KV cache erased." if erased else " (KV erase unavailable)"
+        kv_note = " vLLM will reclaim KV cache on next prefill."
 
         console.print(
             f"  [green]✓  Compacted: {before:,} → {after:,} tokens "

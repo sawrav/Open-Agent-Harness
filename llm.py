@@ -1,10 +1,14 @@
 """
 llm.py — vLLM OpenAI-compatible async streaming client for OpenAgentHarness.
 
-Uses httpx with raw SSE parsing against a vLLM OpenAI server
-http://localhost:8000/v1/chat/completions for true token-by-token
-streaming callbacks and native function calling. API is kept compatible
-with the previous llama.cpp client so agent.py needs no changes.
+Uses httpx with raw SSE parsing against a vLLM OpenAI-compatible server
+(/v1/chat/completions) for true token-by-token streaming and native function
+calling.  Works with any open-weight model served by vLLM — Meta Llama,
+Muse, Mistral, Qwen, DeepSeek, etc.
+
+Model capability flags in config.py control which optional API fields are sent:
+  - ENABLE_THINKING   — budget_tokens for reasoning models (QwQ, DeepSeek-R1, …)
+  - TOOL_CALL_SUPPORTED — whether tools/functions are advertised to the model
 """
 
 from __future__ import annotations
@@ -49,10 +53,8 @@ class LLMClient:
     """
 
     def __init__(self):
-        # vLLM OpenAI server default; override via config if needed
-        base_url = getattr(config, "VLLM_BASE_URL", config.LLM_BASE_URL)
         self._http = httpx.AsyncClient(
-            base_url=base_url,
+            base_url=config.VLLM_BASE_URL,
             headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=5.0),
         )
@@ -65,7 +67,7 @@ class LLMClient:
         budget_tokens: int | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
-        model_name = getattr(config, "VLLM_MODEL", getattr(config, "LLM_MODEL", "local"))
+        model_name = config.VLLM_MODEL
         payload: dict = {
             "model": model_name,
             "messages": messages,
@@ -73,14 +75,20 @@ class LLMClient:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        if tools:
+
+        # Only advertise tools if the model supports function calling.
+        if tools and config.TOOL_CALL_SUPPORTED:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
-        # vLLM supports OpenAI style reasoning params for some models
-        if budget_tokens is not None:
+        # Only send thinking budget for reasoning models (QwQ, DeepSeek-R1, …).
+        # Sending this field to a standard instruct model will be ignored at best
+        # or cause a 400 error at worst depending on the vLLM version.
+        if config.ENABLE_THINKING and budget_tokens is not None:
             if budget_tokens > 0:
-                payload["extra_body"] = {"thinking": {"type": "enabled", "budget_tokens": budget_tokens}}
+                payload["extra_body"] = {
+                    "thinking": {"type": "enabled", "budget_tokens": budget_tokens}
+                }
             else:
                 payload["extra_body"] = {"thinking": {"type": "disabled"}}
 
@@ -140,8 +148,9 @@ class LLMClient:
         except httpx.ConnectError:
             yield ("error", (
                 f"Cannot connect to vLLM server at {self._http.base_url}. "
-                "Start vLLM OpenAI server with:\n"
-                f"  vllm serve {model_name} --port 8000"
+                "Start vLLM with:\n"
+                f"  vllm serve {model_name} --port 8000\n"
+                "Or set VLLM_BASE_URL to point at your running server."
             ))
             self._last_result = StreamResult(content="", tool_calls=[])
             return
