@@ -1,7 +1,12 @@
 # Open-Agent-Harness
 
-A lightweight, extensible agentic harness for running local sympathetic LLMs (having mechanical sympathy!) via
-[llama.cpp](https://github.com/ggerganov/llama.cpp). Fully async, token-streaming, with tool-calling, thinking mode control, and automatic memory compaction.
+A lightweight, extensible agentic harness for running open-weight LLMs locally via
+[vLLM](https://github.com/vllm-project/vllm). Fully async, token-streaming, with
+tool-calling, live reasoning output, and automatic memory compaction.
+
+Default model: **[Muse Glimmer 30B](https://huggingface.co/meta-models/Muse-Glimmer-30B)** —
+Meta's on-device agentic reasoning model. Any model served by vLLM works by setting
+a single environment variable.
 
 **Live site:** `https://github.com/sawrav/Open-Agent-Harness`
 
@@ -13,6 +18,7 @@ A lightweight, extensible agentic harness for running local sympathetic LLMs (ha
 - [Requirements](#requirements)
 - [Setup](#setup)
 - [Usage](#usage)
+- [Switching models](#switching-models)
 - [REPL commands](#repl-commands)
 - [Thinking modes](#thinking-modes)
 - [Built-in tools](#built-in-tools)
@@ -28,21 +34,23 @@ A lightweight, extensible agentic harness for running local sympathetic LLMs (ha
 
 ## Features
 
-- **Async streaming** — tokens are written to the terminal the instant llama.cpp emits them via raw httpx SSE, with zero buffering
-- **`<thinking>` block rendering** — reasoning tokens (`delta.reasoning_content`) streamed live in dim style, visually separated from the final response
+- **Async streaming** — tokens are written to the terminal the instant vLLM emits them via raw httpx SSE, with zero buffering
+- **`<thinking>` block rendering** — reasoning tokens (`delta.reasoning_content`) streamed live in dim style, visually separated from the final response; works with Muse Glimmer, QwQ, DeepSeek-R1, and other reasoning models
 - **Tool calling** — model can invoke local tools; multiple tool calls in one turn execute concurrently via `asyncio.gather`
 - **Autodiscovery** — drop a `.py` file under `tools/` to add a callable tool; drop a `SKILL.md` to inject behavioral instructions into the system prompt
 - **Thinking modes** — three research modes (`fast` / `medium` / `slow`) control the model's reasoning budget; switchable live with `/mode`
-- **Memory compaction** — automatic context management: exact token counting via `/tokenize`, LLM-based summarisation of old messages, KV cache erasure via `/slots/0?action=erase`; manual `/compact` command also available
-- **Graceful error handling** — malformed tool calls are caught before dispatch; HTTP errors (400, 500) are caught and surfaced without crashing the session; context overflow triggers automatic compaction + retry
+- **Memory compaction** — automatic context management: char-based token estimation with vLLM `/v1/tokenize` probe, LLM-based summarisation of old messages, automatic KV cache reclaim on next prefill; manual `/compact` command also available
+- **Graceful error handling** — malformed tool calls are caught before dispatch; HTTP errors are caught and surfaced without crashing the session; context overflow triggers automatic compaction + retry
+- **Zero-edit model switching** — every config value is an environment variable; no source edits needed to run a different model
 
 ---
 
 ## Requirements
 
 - Python 3.11+
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) built and available as `llama-server`
-- A GGUF model (tested with `Muse-Glimmer-30B-Q4_K_M.gguf`)
+- [vLLM](https://github.com/vllm-project/vllm) installed and accessible as `vllm`
+- A Hugging Face model (default: `meta-models/Muse-Glimmer-30B`)
+- A Hugging Face account with access to the model (run `huggingface-cli login` once)
 
 ---
 
@@ -65,25 +73,24 @@ pip install -r requirements.txt
 
 ## Usage
 
-**Step 1 — Start the llama.cpp server** (in a separate terminal):
+**Step 1 — Start the vLLM server** (in a separate terminal):
 
 ```bash
-llama-server \
-  --model ./models/Muse-Glimmer-30B-Q4_K_M.gguf \
-  --ctx-size 16384 \
-  --n-gpu-layers 99 \
-  --threads 16 \
-  --port 8080
+vllm serve meta-models/Muse-Glimmer-30B \
+  --max-model-len 131072 \
+  --tensor-parallel-size 1
 ```
 
-Recommended flags for Apple Silicon (M-series):
+Recommended flags:
 
 | Flag | Value | Reason |
 |---|---|---|
-| `--n-gpu-layers` | `99` | Offload all layers to Metal |
-| `--ctx-size` | `16384` | Must match `CTX_SIZE` in `config.py` |
-| `--threads` | `16` | Large core count on M-series chips |
-| `--defrag-thold` | `0.1` | Enable KV cache defrag for long sessions |
+| `--max-model-len` | `131072` | Muse Glimmer's native context window |
+| `--tensor-parallel-size` | `1` or `2` | Match to your GPU count |
+| `--dtype` | `bfloat16` | Full-precision inference |
+| `--quantization` | `awq` or `fp8` | Reduce VRAM on smaller GPUs |
+| `--enable-reasoning` | _(flag)_ | Required to surface `reasoning_content` in the stream |
+| `--reasoning-parser` | `muse_glimmer` | Route thinking tokens to `delta.reasoning_content` |
 
 **Step 2 — Run the agent:**
 
@@ -91,15 +98,51 @@ Recommended flags for Apple Silicon (M-series):
 python main.py
 ```
 
-The startup banner shows active tools, loaded skills, and current thinking mode:
+The startup banner shows the active model, tools, loaded skills, and current thinking mode:
 
 ```
 OpenAgentHarness ready.
+  Model :  meta-models/Muse-Glimmer-30B
   Tools :  fetch_url, list_directory, read_file, run_shell, write_file
   Skills:  git_operations, summarize
-  Mode  :  medium (4096 budget tokens)
+  Mode  :  medium (2048 budget tokens)
   Type /help for available commands.
 ```
+
+---
+
+## Switching models
+
+No code edits are needed. Set `VLLM_MODEL` (and any other relevant variables) before
+running, then start a matching vLLM server.
+
+```bash
+# Meta Llama 3.1 8B (non-reasoning — disable thinking)
+VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct ENABLE_THINKING=false python main.py
+
+# Meta Llama 3.3 70B
+VLLM_MODEL=meta-llama/Llama-3.3-70B-Instruct ENABLE_THINKING=false python main.py
+
+# Mistral 7B
+VLLM_MODEL=mistralai/Mistral-7B-Instruct-v0.3 ENABLE_THINKING=false python main.py
+
+# Qwen 2.5 7B
+VLLM_MODEL=Qwen/Qwen2.5-7B-Instruct ENABLE_THINKING=false python main.py
+
+# QwQ 32B (reasoning model)
+VLLM_MODEL=Qwen/QwQ-32B ENABLE_THINKING=true python main.py
+
+# DeepSeek R1 (reasoning model)
+VLLM_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-14B ENABLE_THINKING=true python main.py
+
+# Remote vLLM server
+VLLM_BASE_URL=http://10.0.0.5:8000/v1 VLLM_MODEL=meta-models/Muse-Glimmer-30B python main.py
+
+# Base model (no tool calling)
+VLLM_MODEL=meta-llama/Llama-3.1-8B TOOL_CALL_SUPPORTED=false ENABLE_THINKING=false python main.py
+```
+
+See [Configuration reference](#configuration-reference) for all available variables.
 
 ---
 
@@ -109,7 +152,7 @@ OpenAgentHarness ready.
 |---|---|
 | `/mode <name>` | Switch thinking mode: `fast`, `medium`, or `slow` |
 | `/mode` | Show current mode and all options |
-| `/compact` | Manually compact memory and erase KV cache |
+| `/compact` | Manually compact memory |
 | `/tools` | List all available callable tools |
 | `/skills` | List all loaded Markdown skills |
 | `/clear` | Clear conversation history (keeps system prompt) |
@@ -121,18 +164,18 @@ OpenAgentHarness ready.
 ## Thinking modes
 
 Controls how many tokens the model is allowed to spend in `<thinking>` before
-producing a response. Sent to llama.cpp as a `thinking.budget_tokens` field.
-Switch modes live at any point during a session — no restart required.
+producing a response. Only active when `ENABLE_THINKING=true` (the default for
+Muse Glimmer). Switch modes live at any point during a session — no restart required.
 
 | Mode | Budget tokens | Use case |
 |---|---|---|
 | `fast` | 512 | Quick lookups, simple Q&A, low latency |
-| `medium` | 4096 | General use — balanced quality and speed (**default**) |
-| `slow` | 16384 | Deep research, multi-step reasoning, complex analysis |
+| `medium` | 2048 | General use — balanced quality and speed (**default**) |
+| `slow` | 4096 | Deep research, multi-step reasoning, complex analysis |
 
 ```
 You: /mode slow
-Mode → slow (16384 budget tokens)
+Mode → slow (4096 budget tokens)
 
 You: Analyse the architecture of vLLM in detail
 <thinking>
@@ -158,12 +201,13 @@ execution is async. Multiple tool calls in a single turn run concurrently.
 | `write_file` | Write content to a file, creating parent directories if needed |
 | `list_directory` | List files and subdirectories in a directory |
 | `run_shell` | Execute a shell command and return stdout + stderr (30s timeout) |
-| `fetch_url` | Fetch the text content of a URL (capped at 8000 chars) |
+| `fetch_url` | Fetch the text content of a URL (capped at 3000 chars) |
 
 Tool call validation before dispatch:
 - Incomplete delta accumulations (missing `name` or `id`) are skipped with a descriptive error returned to the model
 - Required parameters are checked against the tool's JSON Schema before calling
 - Missing required params return a clean error string to the model rather than raising
+- Tool calls are disabled entirely when `TOOL_CALL_SUPPORTED=false`
 
 ---
 
@@ -184,15 +228,19 @@ Skills are discovered recursively alongside Python tools. A folder with only a
 
 ## Memory compaction
 
-The harness tracks exact token usage via llama.cpp's `/tokenize` endpoint and
-manages the context window automatically. No server restart is ever required.
+The harness tracks token usage and manages the context window automatically.
+No server restart is ever required.
 
 ### Token tracking
+
+Token counts are obtained via vLLM's `/v1/tokenize` endpoint (available since
+vLLM v0.4.3). If the endpoint is unavailable the harness falls back to a
+character-based estimate (`chars / 4`).
 
 Usage is reported in 10K-token bands after each turn:
 
 ```
-  📊 Context: ~12,450 tokens (76% of 16,384)
+  📊 Context: ~12,450 tokens (10% of 131,072)
 ```
 
 ### Auto-compaction
@@ -201,34 +249,31 @@ Compaction is triggered automatically when either condition is met:
 
 | Trigger | Default threshold |
 |---|---|
-| Context usage | ≥ 90% of `CTX_SIZE` |
+| Context usage | ≥ 80% of `CTX_SIZE` |
 | Accumulated tokens | Every 20,000 tokens (`CTX_COMPACT_INTERVAL`) |
 
 ### Compaction cycle
 
 1. The LLM summarises the oldest message pairs into a compact block (keeps the last 4 user/assistant pairs verbatim)
-2. `POST /slots/0?action=erase` erases the slot KV cache
-3. The next request rebuilds the KV from the compacted history automatically
+2. The shortened message history is used on the next request — vLLM reclaims KV cache automatically on the next prefill
 
 ```
-  ⟳  Compacting memory (auto, 90% threshold) — ~14,800 tokens…
-  ✓  Compacted: 14,800 → 2,900 tokens (saved 11,900). KV cache erased. Context now at 18%
+  ⟳  Compacting memory (auto, 80% threshold) — ~105,000 tokens…
+  ✓  Compacted: 105,000 → 2,900 tokens (saved 102,100). vLLM will reclaim KV cache on next prefill. Context now at 2%
 ```
 
 ### Overflow recovery
 
-When llama.cpp returns a `400 exceed_context_size_error`, the harness:
-1. Compacts immediately
-2. Erases the KV cache
-3. Re-appends the failed user message
-4. Retries the turn automatically — transparent to the user
+When vLLM returns a context-exceeded error, the harness:
+1. Compacts the historical messages immediately (preserving in-progress tool calls)
+2. Retries the turn automatically — transparent to the user
 
 ### Manual compaction
 
 ```
 You: /compact
   ⟳  Compacting memory (manual) — ~8,400 tokens…
-  ✓  Compacted: 8,400 → 1,800 tokens (saved 6,600). KV cache erased. Context now at 11%
+  ✓  Compacted: 8,400 → 1,800 tokens (saved 6,600). vLLM will reclaim KV cache on next prefill. Context now at 1%
 ```
 
 ---
@@ -297,31 +342,40 @@ system prompt at startup. No code changes needed.
 
 ## Configuration reference
 
-All configuration is in `config.py`:
+All configuration lives in `config.py`. Every value reads from an environment
+variable of the same name first, falling back to the default shown below.
 
-```python
+```bash
 # ── Server ────────────────────────────────────────────────────────────────────
-LLM_BASE_URL = "http://localhost:8080/v1"   # llama.cpp server URL
-LLM_API_KEY  = "not-needed"                 # API key (unused by default)
-LLM_MODEL    = "local"                      # model name sent in requests
-CTX_SIZE     = 16384                        # must match --ctx-size on the server
+VLLM_BASE_URL=http://localhost:8000/v1   # vLLM OpenAI-compatible server URL
+LLM_API_KEY=not-needed                   # Bearer token (set if vLLM uses --api-key)
 
-# ── System prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = "You are a helpful assistant..."
+# ── Model ─────────────────────────────────────────────────────────────────────
+VLLM_MODEL=meta-models/Muse-Glimmer-30B  # HuggingFace model ID or local path
+CTX_SIZE=131072                           # Must match --max-model-len on the server
+
+# ── Model capability flags ────────────────────────────────────────────────────
+ENABLE_THINKING=true          # true for reasoning models (Muse Glimmer, QwQ, DeepSeek-R1…)
+                              # false for standard instruct models (Llama, Mistral, Qwen…)
+TOOL_CALL_SUPPORTED=true      # false for base models not fine-tuned for function calling
 
 # ── Thinking modes ────────────────────────────────────────────────────────────
-THINKING_MODES = {
-    "fast":   512,     # minimal reasoning
-    "medium": 4096,    # balanced default
-    "slow":   16384,   # deep research
-}
-DEFAULT_THINKING_MODE = "medium"
+# Configured in config.py (not env vars); switch live with /mode
+# fast:   512 budget tokens
+# medium: 2048 budget tokens  (default)
+# slow:   4096 budget tokens
+
+# ── Generation limits ─────────────────────────────────────────────────────────
+# Configured in config.py
+# fast:   1024 max tokens
+# medium: 3072 max tokens
+# slow:   6144 max tokens
 
 # ── Memory compaction ─────────────────────────────────────────────────────────
-CTX_COMPRESS_THRESHOLD  = 0.90    # compact at 90% context usage
-CTX_COMPRESS_KEEP_RECENT = 4      # keep last N user/assistant pairs verbatim
-CTX_COMPACT_INTERVAL    = 20_000  # also compact every 20K accumulated tokens
-CHARS_PER_TOKEN         = 4       # fallback char-based token estimate
+# Configured in config.py
+# CTX_COMPRESS_THRESHOLD=0.80   compact at 80% context usage
+# CTX_COMPRESS_KEEP_RECENT=4    keep last N user/assistant pairs verbatim
+# CTX_COMPACT_INTERVAL=20000    also compact every 20K accumulated tokens
 ```
 
 ---
@@ -332,11 +386,11 @@ CHARS_PER_TOKEN         = 4       # fallback char-based token estimate
 Open-Agent-Harness/
 ├── main.py               # Async entry point (asyncio.run)
 ├── agent.py              # Core async agent loop, REPL, /commands
-├── llm.py                # Raw httpx SSE client, ToolCallAccumulator, StreamResult
+├── llm.py                # vLLM httpx SSE client, ToolCallAccumulator, StreamResult
 ├── registry.py           # Tool + skill autodiscovery and routing
-├── context_manager.py    # Token counting, compaction, KV cache management
-├── config.py             # All configuration
-├── requirements.txt      # httpx, rich, anyio
+├── context_manager.py    # Token counting, compaction, vLLM KV cache management
+├── config.py             # All configuration (env-var overridable)
+├── requirements.txt      # httpx, rich, anyio, vllm
 └── tools/
     ├── __init__.py
     ├── base.py            # BaseTool abstract interface (async run())
