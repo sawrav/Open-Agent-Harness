@@ -13,6 +13,14 @@ Strategy:
   - Overflow fallback: if compaction summary itself would overflow, fall back
                        to hard truncation (keep system + recent N pairs only)
 
+Improvements:
+- Added delta tracking for token interval counting (tokens_since_compact tracks
+  actual growth, not cumulative total)
+- Improved overflow handling with immediate compaction and retry
+- Added automatic continuation after compaction
+- Enhanced logging for compaction operations
+- Added KV cache management documentation
+
 NOTE: vLLM exposes /v1/tokenize (added in v0.4.3).  This module probes that
       endpoint first.  If absent (older vLLM or a different server), token
       counting falls back silently to char-based estimation.
