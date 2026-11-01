@@ -24,6 +24,12 @@ def _env_bool(key: str, default: bool) -> bool:
         return default
     return val.strip().lower() in ("1", "true", "yes")
 
+def _env_list(key: str, default: list[str]) -> list[str]:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return [p.strip() for p in val.split(",") if p.strip()]
+
 
 # ── Server ────────────────────────────────────────────────────────────────────
 
@@ -69,6 +75,12 @@ ENABLE_THINKING: bool = _env_bool("ENABLE_THINKING", True)
 # Set to false for base (non-instruct) models not fine-tuned for function calling.
 # When false, no tools are advertised to the model at all.
 TOOL_CALL_SUPPORTED: bool = _env_bool("TOOL_CALL_SUPPORTED", True)
+
+# ── Tool/Skill Discovery Paths ────────────────────────────────────────────────
+# Additional directories to discover tools and skills from.
+# Comma-separated list of paths. Paths can be absolute or relative to current directory.
+# Tools are discovered recursively: .py files with BaseTool subclasses and SKILL.md files.
+EXTRA_TOOL_PATHS: list[str] = _env_list("EXTRA_TOOL_PATHS", [])
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT: str = (
