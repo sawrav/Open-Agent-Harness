@@ -18,19 +18,19 @@ services:
       # ── Model ────────────────────────────────────────────────────────────────
       # Set to the Hugging Face model ID that vLLM was started with.
       # Examples:
+      #   meta-models/Muse-Glimmer-30B   (default — reasoning model, ENABLE_THINKING=true)
       #   meta-llama/Llama-3.1-8B-Instruct
       #   meta-llama/Llama-3.3-70B-Instruct
-      #   meta-llama/Muse-30B-Instruct-FP8
       #   mistralai/Mistral-7B-Instruct-v0.3
       #   Qwen/Qwen2.5-7B-Instruct
-      - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.1-8B-Instruct}
+      - VLLM_MODEL=${VLLM_MODEL:-meta-models/Muse-Glimmer-30B}
 
       # Context window size — must match --max-model-len on the vLLM server.
       - CTX_SIZE=${CTX_SIZE:-131072}
 
       # ── Model capability flags ───────────────────────────────────────────────
-      # Set ENABLE_THINKING=true for reasoning models (QwQ-32B, DeepSeek-R1, …).
-      - ENABLE_THINKING=${ENABLE_THINKING:-false}
+      # Set ENABLE_THINKING=true for reasoning models (QwQ-32B, DeepSeek-R1, Muse Glimmer, …).
+      - ENABLE_THINKING=${ENABLE_THINKING:-true}
       # Set TOOL_CALL_SUPPORTED=false for base models without function-calling.
       - TOOL_CALL_SUPPORTED=${TOOL_CALL_SUPPORTED:-true}
 

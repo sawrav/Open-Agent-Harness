@@ -5,9 +5,9 @@ Every value can be overridden at runtime via an environment variable of the
 same name, making the harness work against any open-weight model without
 editing this file:
 
-    VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct python main.py
-    VLLM_MODEL=meta-llama/Muse-30B-Instruct VLLM_BASE_URL=http://10.0.0.5:8000/v1 python main.py
-    VLLM_MODEL=Qwen/QwQ-32B ENABLE_THINKING=true python main.py
+    python main.py                                                    # Muse Glimmer 30B (default)
+    VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct ENABLE_THINKING=false python main.py
+    VLLM_MODEL=Qwen/QwQ-32B VLLM_BASE_URL=http://10.0.0.5:8000/v1 python main.py
 """
 
 import os
@@ -37,15 +37,21 @@ LLM_API_KEY: str = _env("LLM_API_KEY", "not-needed")
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 # Hugging Face model ID (or local path) that matches what vLLM was started with.
-# Examples:
-#   meta-llama/Llama-3.1-8B-Instruct
-#   meta-llama/Llama-3.3-70B-Instruct
-#   meta-llama/Muse-30B-Instruct-FP8
-#   mistralai/Mistral-7B-Instruct-v0.3
-#   Qwen/Qwen2.5-7B-Instruct
-#   Qwen/QwQ-32B                         (reasoning — set ENABLE_THINKING=true)
-#   deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
-VLLM_MODEL: str = _env("VLLM_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+# Default: Muse Glimmer 30B — Meta's on-device agentic reasoning model.
+#   Context window : 131,072 tokens
+#   Thinking       : always-on (reasoning_content emitted on every turn)
+#   Tool calling   : first-class, purpose-built for agentic workflows
+#   VRAM           : ~17 GB at Q4_K_M (fits 24 GB GPU)
+#   vLLM launch    : vllm serve meta-models/Muse-Glimmer-30B
+#
+# Other examples:
+#   meta-llama/Llama-3.1-8B-Instruct       (ENABLE_THINKING=false)
+#   meta-llama/Llama-3.3-70B-Instruct      (ENABLE_THINKING=false)
+#   mistralai/Mistral-7B-Instruct-v0.3     (ENABLE_THINKING=false)
+#   Qwen/Qwen2.5-7B-Instruct               (ENABLE_THINKING=false)
+#   Qwen/QwQ-32B                           (ENABLE_THINKING=true)
+#   deepseek-ai/DeepSeek-R1-Distill-Qwen-14B  (ENABLE_THINKING=true)
+VLLM_MODEL: str = _env("VLLM_MODEL", "meta-models/Muse-Glimmer-30B")
 
 # Context window size in tokens.  Must match --max-model-len on the vLLM server
 # (or the model default if --max-model-len is omitted).
@@ -56,9 +62,9 @@ CTX_SIZE: int = _env_int("CTX_SIZE", 131072)
 # they do not support.
 
 # Enable extended thinking / chain-of-thought reasoning tokens.
-# Set to true for reasoning models: Qwen/QwQ-*, DeepSeek-R1-*, Llama-*-Thinker-*
-# When false, no budget_tokens field is sent and <thinking> blocks are never shown.
-ENABLE_THINKING: bool = _env_bool("ENABLE_THINKING", False)
+# Muse Glimmer always emits reasoning_content — thinking is always on by default.
+# Set to false only for non-reasoning instruct models (Llama, Mistral, standard Qwen).
+ENABLE_THINKING: bool = _env_bool("ENABLE_THINKING", True)
 
 # Set to false for base (non-instruct) models not fine-tuned for function calling.
 # When false, no tools are advertised to the model at all.
