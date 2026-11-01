@@ -249,10 +249,14 @@ class ContextManager:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    async def after_turn(self, messages: list[dict]) -> list[dict]:
+    async def after_turn(self, messages: list[dict]) -> tuple[list[dict], bool]:
         """
         Called after every completed turn.
         Updates counters, reports 10K bands, triggers auto-compaction.
+
+        Returns (messages, compacted) where compacted=True means compaction
+        fired this turn.  The caller uses this to decide whether to
+        automatically continue without waiting for user input.
 
         _tokens_since_compact tracks the delta (new tokens this turn) so the
         20K interval fires only after 20K genuinely new tokens, not on the
@@ -274,14 +278,17 @@ class ContextManager:
                 f"({ratio:.0%} of {config.CTX_SIZE:,})[/dim]"
             )
 
+        compacted = False
         if token_count >= config.CTX_SIZE * config.CTX_COMPRESS_THRESHOLD:
             messages = await self.compact(
                 messages, reason=f"auto ({config.CTX_COMPRESS_THRESHOLD:.0%} threshold)"
             )
+            compacted = True
         elif self._tokens_since_compact >= config.CTX_COMPACT_INTERVAL:
             messages = await self.compact(messages, reason="auto (20K interval)")
+            compacted = True
 
-        return messages
+        return messages, compacted
 
     async def handle_overflow(self, messages: list[dict]) -> list[dict]:
         """Called immediately on exceed_context_size_error."""
