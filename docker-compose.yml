@@ -10,8 +10,33 @@ services:
       - .:/app
       - /var/run/docker.sock:/var/run/docker.sock # optional, for nested docker if needed
     environment:
-      - LLM_BASE_URL=http://host.docker.internal:8080/v1
-      # LLM_API_KEY can be overridden at runtime if needed
+      # ── vLLM server ─────────────────────────────────────────────────────────
+      # Override with the address of your running vLLM server.
+      # host.docker.internal resolves to the host machine from inside the container.
+      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://host.docker.internal:8000/v1}
+
+      # ── Model ────────────────────────────────────────────────────────────────
+      # Set to the Hugging Face model ID that vLLM was started with.
+      # Examples:
+      #   meta-llama/Llama-3.1-8B-Instruct
+      #   meta-llama/Llama-3.3-70B-Instruct
+      #   meta-llama/Muse-30B-Instruct-FP8
+      #   mistralai/Mistral-7B-Instruct-v0.3
+      #   Qwen/Qwen2.5-7B-Instruct
+      - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.1-8B-Instruct}
+
+      # Context window size — must match --max-model-len on the vLLM server.
+      - CTX_SIZE=${CTX_SIZE:-131072}
+
+      # ── Model capability flags ───────────────────────────────────────────────
+      # Set ENABLE_THINKING=true for reasoning models (QwQ-32B, DeepSeek-R1, …).
+      - ENABLE_THINKING=${ENABLE_THINKING:-false}
+      # Set TOOL_CALL_SUPPORTED=false for base models without function-calling.
+      - TOOL_CALL_SUPPORTED=${TOOL_CALL_SUPPORTED:-true}
+
+      # ── Auth ────────────────────────────────────────────────────────────────
+      # Set to match --api-key on the vLLM server, or leave as "not-needed".
+      - LLM_API_KEY=${LLM_API_KEY:-not-needed}
     # Uncomment to run interactively
     # stdin_open: true
     # tty: true
