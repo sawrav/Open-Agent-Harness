@@ -6,10 +6,10 @@ Strategy:
                       to character-based estimation if the endpoint is unavailable
   - Context tracking: 10K-token increments reported to the user
   - Auto-compaction:  triggered at CTX_COMPRESS_THRESHOLD (80%) or every
-                      CTX_COMPACT_INTERVAL tokens, whichever comes first
-  - Compaction:       summarise old messages via LLM, then log that the KV cache
-                      will be rebuilt on the next request (vLLM manages its own
-                      KV cache — there is no manual slot-erase API)
+                      CTX_COMPACT_INTERVAL *new* tokens since the last compact
+  - Compaction:       summarise old messages via a dedicated httpx LLM call that
+                      does NOT share the main LLMClient, so _last_result on the
+                      main client is never overwritten during summarisation
   - Overflow fallback: if compaction summary itself would overflow, fall back
                        to hard truncation (keep system + recent N pairs only)
 
@@ -20,6 +20,7 @@ NOTE: vLLM exposes /v1/tokenize (added in v0.4.3).  This module probes that
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import httpx
@@ -34,7 +35,7 @@ console = Console()
 
 
 def _vllm_base() -> str:
-    """Return the vLLM /v1 base URL (used for the /v1/tokenize probe)."""
+    """Return the vLLM /v1 base URL (used for /tokenize and summarisation)."""
     return config.VLLM_BASE_URL.rstrip("/")
 
 
@@ -44,9 +45,6 @@ async def count_tokens(text: str, http: httpx.AsyncClient) -> int:
     """
     Exact token count via vLLM /v1/tokenize endpoint (added in vLLM v0.4.3).
     Falls back to char-based estimation if the endpoint is unavailable.
-
-    vLLM request format:  POST /v1/tokenize  {"model": "<model>", "prompt": "<text>"}
-    vLLM response format: {"tokens": [id, id, …], "count": N}
     """
     try:
         resp = await http.post(
@@ -56,7 +54,6 @@ async def count_tokens(text: str, http: httpx.AsyncClient) -> int:
         )
         if resp.status_code == 200:
             data = resp.json()
-            # vLLM returns either {"tokens": [...]} or {"count": N}
             if "tokens" in data:
                 return len(data["tokens"])
             if "count" in data:
@@ -101,17 +98,51 @@ def _messages_to_text(messages: list[dict]) -> str:
 
 async def erase_kv_cache(http: httpx.AsyncClient, slot_id: int = 0) -> bool:
     """
-    vLLM manages KV cache internally via continuous batching; there is no
-    manual slot-erase API (unlike llama.cpp's /slots/{id}?action=erase).
-
-    After context compaction the message history is already shortened — on the
-    next request vLLM will only prefill the compacted history, effectively
-    reclaiming KV cache space.  No explicit flush is needed or possible.
-
-    Returns True to signal that the compaction cycle completed successfully.
-    The slot_id parameter is kept for API compatibility but is unused.
+    vLLM manages KV cache internally via continuous batching — no manual
+    slot-erase API exists.  After compaction, vLLM reclaims KV automatically
+    on the next prefill of the shortened history.
     """
     return True
+
+
+# ── Isolated summarisation (does NOT share main LLMClient) ───────────────────
+
+async def _summarise(old_text: str, http: httpx.AsyncClient) -> str:
+    """
+    Call /v1/chat/completions directly via a raw httpx POST so that the main
+    LLMClient._last_result is never overwritten during compaction.
+
+    Returns the summary string, or "" on any failure (caller hard-truncates).
+    """
+    payload = {
+        "model": config.VLLM_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise summariser. "
+                    "Summarise the following conversation into a compact paragraph "
+                    "preserving all key facts, decisions, tool results, file paths, "
+                    "code snippets, and context needed to continue the conversation. "
+                    "Output only the summary, no preamble. Keep it under 200 words."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Summarise:\n\n{old_text}",
+            },
+        ],
+        "max_tokens": 512,
+        "stream": False,
+    }
+    try:
+        resp = await http.post("/chat/completions", json=payload, timeout=60.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data["choices"][0]["message"].get("content", "").strip()
+    except Exception:
+        pass
+    return ""
 
 
 # ── Message compression ───────────────────────────────────────────────────────
@@ -139,10 +170,11 @@ async def compress_messages(
 ) -> list[dict]:
     """
     Summarise the oldest non-system message pairs to reduce token usage.
+    Uses an isolated HTTP call so the main LLMClient._last_result is untouched.
 
     Falls back to hard truncation if:
     - Not enough history to split
-    - The summarisation LLM call itself would overflow (old_messages too large)
+    - The old messages are too large to summarise safely
     - The summary comes back empty
     """
     if len(messages) <= 1:
@@ -154,7 +186,6 @@ async def compress_messages(
     user_indices = [i for i, m in enumerate(rest) if m.get("role") == "user"]
 
     if len(user_indices) <= config.CTX_COMPRESS_KEEP_RECENT:
-        # Not enough history to split — hard truncate as last resort
         return _hard_truncate(messages)
 
     split_at = user_indices[-config.CTX_COMPRESS_KEEP_RECENT]
@@ -164,8 +195,6 @@ async def compress_messages(
     if not old_messages:
         return messages
 
-    # Safety check: if old_messages text alone exceeds 60% of CTX_SIZE,
-    # the summarisation request itself would overflow. Hard-truncate instead.
     old_text = _messages_to_text(old_messages)
     old_tokens = await count_tokens(old_text, http)
     if old_tokens > int(config.CTX_SIZE * 0.60):
@@ -175,34 +204,13 @@ async def compress_messages(
         )
         return _hard_truncate(messages)
 
-    # Truncate old_text to be safe before sending to LLM
     max_summary_input_chars = config.CTX_SIZE * config.CHARS_PER_TOKEN // 2
     if len(old_text) > max_summary_input_chars:
         old_text = old_text[:max_summary_input_chars] + "\n[truncated]"
 
-    summary_request = [
-        {
-            "role": "system",
-            "content": (
-                "You are a concise summariser. "
-                "Summarise the following conversation into a compact paragraph "
-                "preserving all key facts, decisions, tool results, file paths, "
-                "code snippets, and context needed to continue the conversation. "
-                "Output only the summary, no preamble. Keep it under 200 words."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Summarise:\n\n{old_text}",
-        },
-    ]
+    # Use isolated HTTP call — does NOT touch the main LLMClient._last_result
+    summary = await _summarise(old_text, http)
 
-    summary_parts: list[str] = []
-    async for kind, token in llm.stream(summary_request, max_tokens=512):
-        if kind == "content":
-            summary_parts.append(token)
-
-    summary = "".join(summary_parts).strip()
     if not summary:
         console.print("  [dim yellow]⚠  Summarisation returned empty — hard truncating[/dim yellow]")
         return _hard_truncate(messages)
@@ -220,21 +228,24 @@ async def compress_messages(
 class ContextManager:
     """
     Orchestrates token tracking, auto-compaction, and KV cache management.
-    Uses a dedicated httpx client pointing at the server root (not /v1) for
-    /tokenize and /slots endpoints.
+
+    Token interval tracking: _tokens_since_compact accumulates the *delta*
+    (new tokens added each turn), not the full history size, so the 20K
+    interval fires only after 20K genuinely new tokens have been generated.
     """
 
     def __init__(self, llm: "LLMClient"):
         self._llm = llm
-        # Dedicated client at the vLLM /v1 base for the /tokenize probe.
-        self._server_http = httpx.AsyncClient(
+        # Shared client for /tokenize and summarisation — same server, no coupling
+        # to LLMClient so compaction never overwrites LLMClient._last_result.
+        self._http = httpx.AsyncClient(
             base_url=_vllm_base(),
             headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0),
+            timeout=httpx.Timeout(connect=5.0, read=60.0, write=5.0, pool=5.0),
         )
         self._last_reported_band = 0
-        self._tokens_since_compact = 0
-        self._total_tokens = 0
+        self._tokens_since_compact = 0   # delta since last compact, not total
+        self._last_token_count = 0       # history size at previous turn
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -242,10 +253,17 @@ class ContextManager:
         """
         Called after every completed turn.
         Updates counters, reports 10K bands, triggers auto-compaction.
+
+        _tokens_since_compact tracks the delta (new tokens this turn) so the
+        20K interval fires only after 20K genuinely new tokens, not on the
+        first turn that crosses the cumulative total of 20K.
         """
-        token_count = await count_messages_tokens(messages, self._server_http)
-        self._total_tokens = token_count
-        self._tokens_since_compact += token_count
+        token_count = await count_messages_tokens(messages, self._http)
+
+        # Delta = growth since last measurement (floor at 0 to handle compaction)
+        delta = max(0, token_count - self._last_token_count)
+        self._tokens_since_compact += delta
+        self._last_token_count = token_count
 
         band = (token_count // 10_000) * 10_000
         if band > self._last_reported_band:
@@ -257,7 +275,9 @@ class ContextManager:
             )
 
         if token_count >= config.CTX_SIZE * config.CTX_COMPRESS_THRESHOLD:
-            messages = await self.compact(messages, reason=f"auto ({config.CTX_COMPRESS_THRESHOLD:.0%} threshold)")
+            messages = await self.compact(
+                messages, reason=f"auto ({config.CTX_COMPRESS_THRESHOLD:.0%} threshold)"
+            )
         elif self._tokens_since_compact >= config.CTX_COMPACT_INTERVAL:
             messages = await self.compact(messages, reason="auto (20K interval)")
 
@@ -266,7 +286,7 @@ class ContextManager:
     async def handle_overflow(self, messages: list[dict]) -> list[dict]:
         """Called immediately on exceed_context_size_error."""
         console.print(
-            "  [bold red]Context overflow — compacting and erasing KV cache…[/bold red]"
+            "  [bold red]Context overflow — compacting history…[/bold red]"
         )
         return await self.compact(messages, reason="overflow recovery")
 
@@ -277,37 +297,38 @@ class ContextManager:
     ) -> list[dict]:
         """
         Full compaction cycle:
-          1. LLM-summarise old messages (with hard-truncation fallback)
-          2. Erase KV cache
+          1. LLM-summarise old messages via isolated HTTP call
+          2. Reset delta counter; update last_token_count to post-compact size
         """
-        before = await count_messages_tokens(messages, self._server_http)
+        before = await count_messages_tokens(messages, self._http)
         console.print(
             f"  [yellow]⟳  Compacting memory ({reason}) — "
             f"~{before:,} tokens in history…[/yellow]"
         )
 
-        messages = await compress_messages(messages, self._llm, self._server_http)
+        messages = await compress_messages(messages, self._llm, self._http)
 
-        after = await count_messages_tokens(messages, self._server_http)
+        after = await count_messages_tokens(messages, self._http)
         saved = before - after
         ratio = after / config.CTX_SIZE
 
-        erased = await erase_kv_cache(self._server_http)
-        kv_note = " vLLM will reclaim KV cache on next prefill."
+        await erase_kv_cache(self._http)
 
         console.print(
             f"  [green]✓  Compacted: {before:,} → {after:,} tokens "
-            f"(saved {saved:,}).{kv_note} "
+            f"(saved {saved:,}). vLLM will reclaim KV cache on next prefill. "
             f"Context now at {ratio:.0%}[/green]"
         )
 
+        # Reset interval counter and baseline so delta tracking restarts cleanly
         self._tokens_since_compact = 0
+        self._last_token_count = after
         self._last_reported_band = (after // 10_000) * 10_000
 
         return messages
 
     async def token_count(self, messages: list[dict]) -> int:
-        return await count_messages_tokens(messages, self._server_http)
+        return await count_messages_tokens(messages, self._http)
 
     async def aclose(self):
-        await self._server_http.aclose()
+        await self._http.aclose()
