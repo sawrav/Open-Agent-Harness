@@ -197,9 +197,25 @@ class Agent:
             assistant_msg = self._build_assistant_message(result)
             self.messages.append(assistant_msg)
 
-            # ── No tool calls → done ──────────────────────────────────────────
+            # ── No tool calls → done with this LLM round ─────────────────────
             if not result.has_tool_calls:
-                self.messages = await self.ctx_manager.after_turn(self.messages)
+                self.messages, compacted = await self.ctx_manager.after_turn(self.messages)
+                if compacted:
+                    # Compaction fired at end of turn — the model may have just
+                    # described a plan or partially completed work.  Inject a
+                    # silent continuation nudge so the agent resumes automatically
+                    # without the user having to re-prompt.
+                    console.print(
+                        "  [dim]↩  Continuing after compaction…[/dim]"
+                    )
+                    self.messages.append({
+                        "role": "user",
+                        "content": "Continue with your plan.",
+                    })
+                    # Reset turn_start_index to the new continuation message
+                    turn_start_index = len(self.messages) - 1
+                    # Loop back to issue another LLM call automatically
+                    continue
                 break
 
             # ── Execute tool calls concurrently ──────────────────────────────
@@ -244,7 +260,7 @@ class Agent:
                         sys.stdout.flush()
                 sys.stdout.write("\n")
                 sys.stdout.flush()
-                self.messages = await self.ctx_manager.after_turn(self.messages)
+                self.messages, _ = await self.ctx_manager.after_turn(self.messages)
                 break  # break (not return) — leaves run_once() cleanly,
                        # user can continue the conversation immediately
 
